@@ -13,9 +13,10 @@ and includes the upstream licence, manifest, English translations and hacs.json.
 Publication and progression checklist:
 
 1. Keep the offline tests, Hassfest and lint passing (these currently pass and
-   have repeatable CI commands). HACS validation, type checks and full
-   Core-style config-flow coverage remain outstanding for stable/upstream
-   readiness. Verify GitHub Actions results after publication.
+   have repeatable CI commands). Official HACS packaging validation is now in
+   CI. Type checks and porting the fully covered downstream config-flow tests
+   to Core fixtures remain outstanding for stable/upstream readiness. Verify
+   GitHub Actions results after publication.
 2. Complete a backed-up live pilot and rollback test. Record precisely which
    HA versions and controller types were actually tested.
 3. Review the copied source attribution and licence, and remove credentials,

@@ -17,5 +17,5 @@
     "evohome-async>=2.1.0"
   ],
   "single_config_entry": true,
-  "version": "0.1.0a1"
+  "version": "0.1.0a2"
 }

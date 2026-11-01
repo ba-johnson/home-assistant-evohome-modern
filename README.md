@@ -14,7 +14,7 @@ before installing it. It is not ready for unattended production deployment.
 
 Add `https://github.com/ba-johnson/home-assistant-evohome-modern` to HACS as a
 custom repository with category **Integration**, enable prerelease versions,
-and select `v0.1.0a1`. Alternatively, copy `custom_components/evohome` into your
+and select `v0.1.0a2`. Alternatively, copy `custom_components/evohome` into your
 HA configuration directory's `custom_components` folder. Back up any existing
 directory first. Restart HA to load it, then use Devices & services to configure
 Evohome. Existing YAML installations are imported; follow the migration guide
@@ -98,7 +98,8 @@ Validated on 31 October–1 November 2026 against HA 2026.10.4 / Python 3.14.9:
   and the OAuth token request only, issued no heating commands, and persisted
   no account credentials or tokens.
 
-The checked-in CI workflow repeats the offline tests, lint and Hassfest commands.
+The checked-in CI workflow repeats the offline tests, lint and Hassfest commands,
+enforces config-flow coverage and runs the official HACS packaging validator.
 Check the repository's Actions tab for the current GitHub workflow results.
 
 The private pilot verified live YAML import, existing entity preservation, new
