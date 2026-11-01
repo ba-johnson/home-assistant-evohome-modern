@@ -1,0 +1,108 @@
+--- a/homeassistant/components/evohome/button.py
++++ b/homeassistant/components/evohome/button.py
+@@ -73,6 +73,20 @@
+ 
+     _evo_device: evo.ControlSystem
+ 
++    @override
++    async def async_press(self) -> None:
++        """Return heating and DHW to schedule, including native reset controllers."""
++        try:
++            await self.coordinator.call_client_api(
++                self._evo_device.reset(), request_refresh=False
++            )
++            if self._evo_device.hotwater:
++                await self.coordinator.call_client_api(
++                    self._evo_device.hotwater.reset(), request_refresh=False
++                )
++        finally:
++            await self.coordinator.async_request_refresh()
++
+     @property
+     @override
+     def name(self) -> str:
+--- a/tests/components/evohome/test_button.py
++++ b/tests/components/evohome/test_button.py
+@@ -81,7 +81,10 @@
+ ) -> None:
+     """Test SERVICE_PRESS on the system reset button."""
+ 
+-    with patch("evohomeasync2.control_system.ControlSystem.reset") as mock_fcn:
++    with (
++        patch("evohomeasync2.control_system.ControlSystem.reset") as mock_fcn,
++        patch("evohomeasync2.hotwater.HotWater.reset") as mock_dhw,
++    ):
+         await hass.services.async_call(
+             BUTTON_DOMAIN,
+             SERVICE_PRESS,
+@@ -90,6 +93,7 @@
+         )
+ 
+         mock_fcn.assert_awaited_once_with()
++        mock_dhw.assert_awaited_once_with()
+ 
+ 
+ @pytest.mark.parametrize("install", ["default"])
+--- /dev/null
++++ b/tests/components/evohome/test_system_reset_dhw.py
+@@ -0,0 +1,60 @@
++"""Regression coverage for controller reset leaving DHW overridden."""
++
++from collections.abc import Awaitable
++from unittest.mock import AsyncMock, MagicMock
++
++import evohomeasync2 as evo
++import pytest
++
++from homeassistant.components.evohome.button import EvoSystemResetButton
++from homeassistant.components.evohome.coordinator import EvoDataUpdateCoordinator
++from homeassistant.core import HomeAssistant
++
++
++@pytest.mark.parametrize("has_hot_water", [True, False])
++async def test_system_reset_clears_hot_water(
++    hass: HomeAssistant, has_hot_water: bool
++) -> None:
++    """Clear DHW separately because controller AutoWithReset does not do so."""
++    coordinator = MagicMock(spec=EvoDataUpdateCoordinator)
++    coordinator.hass = hass
++
++    async def call_api(
++        coro: Awaitable[object], *, request_refresh: bool = True
++    ) -> object:
++        return await coro
++
++    coordinator.call_client_api = AsyncMock(side_effect=call_api)
++    coordinator.async_request_refresh = AsyncMock()
++    controller = MagicMock(spec=evo.ControlSystem)
++    controller.id = "test-controller"
++    controller.reset = AsyncMock()
++    hot_water = MagicMock(spec=evo.HotWater)
++    hot_water.reset = AsyncMock()
++    controller.hotwater = hot_water if has_hot_water else None
++    await EvoSystemResetButton(coordinator, controller).async_press()
++    controller.reset.assert_awaited_once()
++    assert hot_water.reset.await_count == int(has_hot_water)
++    coordinator.async_request_refresh.assert_awaited_once()
++
++
++async def test_failed_reset_still_refreshes(hass: HomeAssistant) -> None:
++    """Report a failing reset and refresh the state after partial completion."""
++    coordinator = MagicMock(spec=EvoDataUpdateCoordinator)
++    coordinator.hass = hass
++
++    async def call_api(
++        coro: Awaitable[object], *, request_refresh: bool = True
++    ) -> object:
++        return await coro
++
++    coordinator.call_client_api = AsyncMock(side_effect=call_api)
++    coordinator.async_request_refresh = AsyncMock()
++    controller = MagicMock(spec=evo.ControlSystem)
++    controller.id = "test-controller"
++    controller.reset = AsyncMock()
++    controller.hotwater = MagicMock(spec=evo.HotWater)
++    controller.hotwater.reset = AsyncMock(side_effect=RuntimeError("reset failed"))
++    with pytest.raises(RuntimeError, match="reset failed"):
++        await EvoSystemResetButton(coordinator, controller).async_press()
++    coordinator.async_request_refresh.assert_awaited_once()

@@ -18,8 +18,9 @@ and select `v0.1.0a2`. Alternatively, copy `custom_components/evohome` into your
 HA configuration directory's `custom_components` folder. Back up any existing
 directory first. Restart HA to load it, then use Devices & services to configure
 Evohome. Existing YAML installations are imported; follow the migration guide
-before removing the legacy YAML. Installation through HACS has not yet been
-tested end to end.
+before removing the legacy YAML. The real HACS installer was tested in an empty
+HA config, installing a1 and updating to a2; HA discovery and installed content
+were verified. The graphical HACS setup path was not exercised.
 
 The integration remains **cloud polling**. A UI config flow does not make the
 Honeywell connection local or fix faults in the controller or cloud API.
@@ -113,22 +114,27 @@ dashboard reset button was exercised on a phone: a permanent 5-degree override
 cleared, the vendor app returned to its prior target, and HA subsequently
 confirmed FollowSchedule at that target. HA's immediate state can lag the app
 until a later refresh. This does not establish standalone zone-reset behaviour.
-Type checks, HACS installation validation and porting tests to Core's pytest
-fixtures remain outstanding. This is not a quality-tier or universal
+The HACS installer backend passed clean-install/update checks. A focused
+upstream hot-water reset patch passed 169 Core tests and 163 snapshots, plus
+Core type checking. The larger migration bundle still needs rebasing onto
+current Core's vendor API and schedule caching. This is not a quality-tier or universal
 compatibility claim, and the unexplained original 5-degree setpoints have not
 been proven to have a single root cause.
 
-One direct-zone test accepted a short temporary override, but clearing it reported
-FollowSchedule before the effective target converged. The original target was
-explicitly restored and read back. Immediate zone-reset target propagation still
-needs investigation; schedule mode alone is not proof of
+Controlled direct-zone tests reported FollowSchedule after clearing an override,
+but the effective target did not return to its prior value. The original target
+was explicitly restored and read back with FollowSchedule. Standalone zone-reset
+target propagation remains a confirmed acceptance failure; schedule mode alone is not proof of
 the effective target. This is separate from the successful system reset-all test.
 
 The pilot also exposed own-area/own-name repairs when legacy entities gained
 devices. Those repairs were cleared using persisted, room-qualified registry
 names without changing IDs or room assignments. Device-relative entity-name
-defaults and translations are now regression-tested and installed for the next
-normal restart; they have not yet been loaded by a restarted live HA process.
+defaults and translations are regression-tested and were verified after an
+authorised live restart: all 37 entity IDs/area assignments survived, all 13
+climate/hot-water naming defaults loaded, and no repair warnings remained.
+
+See the [focused Core patch](contrib/README.md) and [current readiness](docs/CORE-READINESS.md).
 
 See [Migration and rollback](docs/MIGRATION.md) and
 [Publication route](docs/PUBLICATION.md). Do not install this alpha on a live

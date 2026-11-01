@@ -25,6 +25,17 @@ Completed:
   the vendor app and subsequent HA refresh confirmed the previous target and
   FollowSchedule. No test override remains in that zone.
 
+Additional acceptance completed:
+
+- Authorised live restart with timestamped component/config/registry backups.
+- All 37 entity IDs and areas preserved; 13 source naming defaults loaded.
+- Zero active repairs; Kitchen mapping/sensor and dashboard reset target verified.
+- Real HACS installer: clean a1 installation and update to a2 in an empty config,
+  with HA discovery and 21 installed files checked. Text content matched after
+  accounting for line-ending normalisation; icons matched directly.
+- Focused hot-water reset patch validated on current Core: 169 tests, 163
+  snapshots, mypy and lint passed. Full migration port remains separate.
+
 Still pending: natural schedule-transition acceptance. A bounded 26-hour,
 read-only observer is recording transitions; no heating commands are sent.
 The reset card's phone tap path was verified by the pilot user. General browser
@@ -34,13 +45,15 @@ has been created.
 
 A direct-zone temporary override was accepted. The immediate zone-reset target
 assertion did not pass even though the reported mode subsequently cleared; the
-original target was explicitly restored and verified. Target propagation after a
-zone-only reset remains an investigation item for stable-release readiness.
+original target was explicitly restored and verified. The repeated standalone
+zone-reset test also failed target acceptance after its mode cleared; this
+remains a stable-release blocker. Cleanup restored the recorded target and
+FollowSchedule. No test override remains.
 
 The later naming-repair task cleared twelve live repairs using persistent,
 room-qualified entity names. IDs and areas were unchanged. Correct source naming
-defaults are installed for the next normal restart; the repair itself did not
-need another restart. See NAMING-REPAIR-TASK.md.
+defaults were subsequently loaded and verified during the authorised acceptance
+restart. See NAMING-REPAIR-TASK.md for the original repair history.
 
 Private paths, backup IDs, rollback commands and observations are recorded
 outside this distributable repository in the infrastructure investigation files.

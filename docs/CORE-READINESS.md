@@ -2,7 +2,7 @@
 
 This is a downstream experimental integration, not an approved Core contribution.
 
-Completed against HA 2026.10.4:
+Completed validation:
 
 - 35 offline tests using the real HA runtime, plus Ruff and Hassfest checks.
 - 100% line and branch coverage for `config_flow.py`, enforced by CI.
@@ -13,19 +13,34 @@ Completed against HA 2026.10.4:
 - One live migration, selective rollback and config-entry-only startup.
 - Actual phone dashboard reset-all cleared a permanent override; the vendor app
   and a subsequent HA refresh confirmed the original target and FollowSchedule.
+- Live restart preserved all 37 entity IDs and areas, loaded all 13 climate/DHW
+  source naming defaults and left zero active repairs.
+- Real HACS clean installation of a1 and update to a2 in a disposable config;
+  HA discovery verified, and 21 files matched published content (19 text files
+  required line-ending normalisation for comparison). No graphical HACS test.
+- A focused DHW reset patch on Core commit
+  `d6e25b0c2cb2eea0eb7b7f61691801fbf4a70a99` passed the full Evohome suite:
+  169 tests, 163 snapshots, mypy for 10 modules and Ruff. Python 3.14.10 and
+  Core's pinned `evohome-async==3.1.0` were used. See `contrib/README.md`.
+- The separate migration prototype has 19 passing Core-fixture flow tests and
+  100% config-flow coverage, using vendor 2.1.0. That does not establish full
+  migration compatibility with current Core's vendor 3.1.0.
 
 Open acceptance work:
 
-- Complete the bounded natural schedule observation. One natural hot-water
-  transition has been captured; overnight heating transitions remain pending.
-- Reproduce standalone zone reset with timed vendor/HA reads. A successful mode
-  change alone is insufficient proof that the effective target has converged.
-- Load source naming defaults at the next planned live restart and recheck
-  entity IDs, areas and repair warnings. Persisted registry names already work.
-- Exercise installation/update through HACS on a disposable installation.
-- Port tests into Core's pytest fixtures and integration test paths; run Core
-  type checking and tests against the actual current contribution checkout.
-  Runtime-unit-test coverage is not a substitute for that review.
+- Complete the bounded natural schedule observation. Natural hot-water and
+  heating transitions have been captured; the overnight/full observation window
+  remains pending. A read-only summary is generated automatically at completion.
+- Standalone zone reset was reproduced: mode cleared but effective target did
+  not restore. Cleanup restored the recorded target and FollowSchedule. The
+  behaviour must be understood/fixed before a stable full-bundle release.
+- Rebase the full migration onto current Core's vendor 3.1.0 APIs and preserve
+  its hourly schedule-cache behaviour. The older-baseline bundle cannot simply
+  replace current upstream files. Then migrate and run the entire existing
+  Core suite, beyond the passing prototype flow tests.
+- Complete graphical HACS acceptance if claiming a fully tested UI setup path.
+- Run all Core pre-commit hooks in a Git checkout and complete human review
+  before upstream submission; the source-archive test tree cannot run Git hooks.
 
 Proposed contribution order (not submitted):
 
