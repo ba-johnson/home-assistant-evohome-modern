@@ -1,0 +1,3187 @@
+diff --git a/homeassistant/components/evohome/__init__.py b/homeassistant/components/evohome/__init__.py
+index 63c31af712..710e75a730 100644
+--- a/homeassistant/components/evohome/__init__.py
++++ b/homeassistant/components/evohome/__init__.py
+@@ -7,6 +7,7 @@ Note that the API used by this integration's client does not support cooling.
+ """
+ 
+ from dataclasses import dataclass
++from datetime import timedelta
+ import logging
+ from typing import Final
+ 
+@@ -14,6 +15,7 @@ import evohomeasync as ec1
+ import evohomeasync2 as ec2
+ import probatio
+ 
++from homeassistant.config_entries import ConfigEntry
+ from homeassistant.const import (
+     CONF_PASSWORD,
+     CONF_SCAN_INTERVAL,
+@@ -21,17 +23,19 @@ from homeassistant.const import (
+     Platform,
+ )
+ from homeassistant.core import HomeAssistant
++from homeassistant.exceptions import HomeAssistantError
+ from homeassistant.helpers import config_validation as cv, issue_registry as ir
+ from homeassistant.helpers.aiohttp_client import async_get_clientsession
+-from homeassistant.helpers.discovery import async_load_platform
++from homeassistant.helpers.storage import Store
+ from homeassistant.helpers.typing import ConfigType
+ 
+ from .const import (
+     CONF_LOCATION_IDX,
+     DOMAIN,
+-    EVOHOME_DATA,
+     SCAN_INTERVAL_DEFAULT,
+     SCAN_INTERVAL_MINIMUM,
++    STORAGE_KEY,
++    STORAGE_VER,
+ )
+ from .coordinator import EvoDataUpdateCoordinator
+ from .services import async_setup_services
+@@ -60,17 +64,17 @@ CONFIG_SCHEMA: Final = probatio.Schema(
+ 
+ @dataclass
+ class EvoData:
+-    """Dataclass for storing evohome data."""
++    """Entry-owned runtime data."""
+ 
+     coordinator: EvoDataUpdateCoordinator
+-    loc_idx: int
+-    tcs: ec2.ControlSystem
+ 
+ 
+-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+-    """Set up the Evohome integration."""
++type EvoConfigEntry = ConfigEntry[EvoData]
++PLATFORMS = [Platform.CLIMATE, Platform.BUTTON, Platform.WATER_HEATER, Platform.SENSOR]
++
+ 
+-    # Remove any (persistent) repair issues for deprecations that have been completed
++async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
++    """Register actions and start a read-only legacy configuration import."""
+     for issue_id in (
+         "deprecated_clear_zone_override_service",
+         "deprecated_preset_reset",
+@@ -78,49 +82,78 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+         "deprecated_set_system_mode_service",
+     ):
+         ir.async_delete_issue(hass, DOMAIN, issue_id)
++    async_setup_services(hass)
++    if DOMAIN in config:
++        data = dict(config[DOMAIN])
++        data[CONF_SCAN_INTERVAL] = int(data[CONF_SCAN_INTERVAL].total_seconds())
++        hass.async_create_task(_async_import_yaml(hass, data))
++    else:
++        ir.async_delete_issue(hass, DOMAIN, "yaml_imported")
++        ir.async_delete_issue(hass, DOMAIN, "yaml_import_failed")
++    return True
++
++
++async def _async_import_yaml(hass: HomeAssistant, data: dict[str, object]) -> None:
++    """Make failed legacy imports visible as repairs without logging credentials."""
++    result = await hass.config_entries.flow.async_init(
++        DOMAIN, context={"source": "import"}, data=data
++    )
++    reason = result.get("reason")
++    if result["type"] == "abort" and reason not in (
++        "single_instance_allowed",
++        "already_configured",
++    ):
++        ir.async_create_issue(
++            hass,
++            DOMAIN,
++            "yaml_import_failed",
++            is_fixable=False,
++            severity=ir.IssueSeverity.ERROR,
++            translation_key="yaml_import_failed",
++            translation_placeholders={"reason": str(reason)},
++        )
++    else:
++        ir.async_delete_issue(hass, DOMAIN, "yaml_import_failed")
++
+ 
+-    token_manager = TokenManager(
++async def async_setup_entry(hass: HomeAssistant, entry: EvoConfigEntry) -> None:
++    """Set up this controller without writing to the heating system."""
++    manager = TokenManager(
+         hass,
+-        config[DOMAIN][CONF_USERNAME],
+-        config[DOMAIN][CONF_PASSWORD],
++        entry.data[CONF_USERNAME],
++        entry.data[CONF_PASSWORD],
+         async_get_clientsession(hass),
++        store_key=f"{DOMAIN}.{entry.entry_id}",
++        legacy_store_key=STORAGE_KEY if entry.source == "import" else None,
+     )
+     coordinator = EvoDataUpdateCoordinator(
+         hass,
+         _LOGGER,
+-        ec2.EvohomeClient(token_manager),
++        ec2.EvohomeClient(manager),
+         name=f"{DOMAIN}_coordinator",
+-        update_interval=config[DOMAIN][CONF_SCAN_INTERVAL],
+-        location_idx=config[DOMAIN][CONF_LOCATION_IDX],
+-        client_v1=ec1.EvohomeClient(token_manager),
++        update_interval=timedelta(seconds=entry.options.get(CONF_SCAN_INTERVAL, 300)),
++        location_idx=entry.data.get(CONF_LOCATION_IDX, 0),
++        location_id=entry.data["location_id"],
++        system_id=entry.data["system_id"],
++        config_entry=entry,
++        client_v1=ec1.EvohomeClient(manager),
+     )
++    await coordinator.async_config_entry_first_refresh()
++    entry.runtime_data = EvoData(coordinator)
++    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
++    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+ 
+-    await coordinator.async_register_shutdown()
+-    await coordinator.async_first_refresh()
+ 
+-    if not coordinator.last_update_success:
+-        _LOGGER.error(f"Failed to fetch initial data: {coordinator.last_exception}")  # noqa: G004
+-        return False
++async def _async_options_updated(hass: HomeAssistant, entry: EvoConfigEntry) -> None:
++    await hass.config_entries.async_reload(entry.entry_id)
+ 
+-    assert coordinator.tcs is not None  # mypy
+ 
+-    hass.data[EVOHOME_DATA] = EvoData(
+-        coordinator=coordinator,
+-        loc_idx=coordinator.loc_idx,
+-        tcs=coordinator.tcs,
+-    )
++async def async_unload_entry(hass: HomeAssistant, entry: EvoConfigEntry) -> None:
++    """Unload platforms and coordinator listeners without restarting HA."""
++    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
++        raise HomeAssistantError("Unable to unload Evohome platforms")
+ 
+-    hass.async_create_task(
+-        async_load_platform(hass, Platform.CLIMATE, DOMAIN, {}, config)
+-    )
+-    hass.async_create_task(
+-        async_load_platform(hass, Platform.BUTTON, DOMAIN, {}, config)
+-    )
+-    if coordinator.tcs.hotwater:
+-        hass.async_create_task(
+-            async_load_platform(hass, Platform.WATER_HEATER, DOMAIN, {}, config)
+-        )
+-
+-    async_setup_services(hass)
+ 
+-    return True
++async def async_remove_entry(hass: HomeAssistant, entry: EvoConfigEntry) -> None:
++    """Remove only this entry's cached credentials."""
++    await Store(hass, STORAGE_VER, f"{DOMAIN}.{entry.entry_id}").async_remove()
+diff --git a/homeassistant/components/evohome/button.py b/homeassistant/components/evohome/button.py
+index 68a8258ee2..bb37bca352 100644
+--- a/homeassistant/components/evohome/button.py
++++ b/homeassistant/components/evohome/button.py
+@@ -1,5 +1,10 @@
+ """Support for Button entities of the Evohome integration."""
+ 
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from . import EvoConfigEntry
++
+ from typing import override
+ 
+ import evohomeasync2 as evo
+@@ -8,27 +13,22 @@ from homeassistant.components.button import ButtonEntity
+ from homeassistant.const import EntityCategory
+ from homeassistant.core import HomeAssistant
+ from homeassistant.helpers.entity_platform import AddEntitiesCallback
+-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+ from homeassistant.helpers.update_coordinator import CoordinatorEntity
+ 
+-from .const import EVOHOME_DATA
+ from .coordinator import EvoDataUpdateCoordinator
++from .device import device_info
+ from .entity import is_valid_zone, unique_zone_id
+ 
+ 
+-async def async_setup_platform(
++async def async_setup_entry(
+     hass: HomeAssistant,
+-    _: ConfigType,
++    entry: EvoConfigEntry,
+     async_add_entities: AddEntitiesCallback,
+-    discovery_info: DiscoveryInfoType | None = None,
+ ) -> None:
+     """Set up the button platform for Evohome."""
+ 
+-    if discovery_info is None:
+-        return
+-
+-    coordinator = hass.data[EVOHOME_DATA].coordinator
+-    tcs = hass.data[EVOHOME_DATA].tcs
++    coordinator = entry.runtime_data.coordinator
++    tcs = coordinator.tcs
+ 
+     entities: list[EvoResetButtonBase] = [EvoSystemResetButton(coordinator, tcs)]
+ 
+@@ -47,6 +47,7 @@ class EvoResetButtonBase(CoordinatorEntity[EvoDataUpdateCoordinator], ButtonEnti
+ 
+     # for _attr_device_class, ButtonDeviceClass.RESET is not available
+     _attr_entity_category = EntityCategory.CONFIG
++    _attr_has_entity_name = True
+ 
+     _evo_device: evo.ControlSystem | evo.HotWater | evo.Zone
+ 
+@@ -59,6 +60,12 @@ class EvoResetButtonBase(CoordinatorEntity[EvoDataUpdateCoordinator], ButtonEnti
+         super().__init__(coordinator, context=evo_device.id)
+ 
+         self._evo_device = evo_device
++        kind = (
++            "zone"
++            if isinstance(evo_device, evo.Zone)
++            else ("dhw" if isinstance(evo_device, evo.HotWater) else "system")
++        )
++        self._attr_device_info = device_info(coordinator.hass, evo_device, kind)
+ 
+         self._attr_unique_id = f"{evo_device.id}_reset"
+ 
+@@ -71,30 +78,38 @@ class EvoResetButtonBase(CoordinatorEntity[EvoDataUpdateCoordinator], ButtonEnti
+ class EvoSystemResetButton(EvoResetButtonBase):
+     """Button entity for system reset."""
+ 
++    _attr_translation_key = "controller_reset"
++
+     _evo_device: evo.ControlSystem
+ 
+-    @property
+     @override
+-    def name(self) -> str:
+-        """Return the entity name (follows location renames)."""
+-        return f"Reset {self._evo_device.location.name}"
++    async def async_press(self) -> None:
++        """Return heating and DHW to schedule, including native reset controllers."""
++        try:
++            await self.coordinator.call_client_api(
++                self._evo_device.reset(), request_refresh=False
++            )
++            if self._evo_device.hotwater:
++                await self.coordinator.call_client_api(
++                    self._evo_device.hotwater.reset(), request_refresh=False
++                )
++        finally:
++            await self.coordinator.async_request_refresh()
+ 
+ 
+ class EvoDhwResetButton(EvoResetButtonBase):
+     """Button entity for DHW override reset."""
+ 
+-    _evo_device: evo.HotWater
++    _attr_translation_key = "dhw_reset"
+ 
+-    @property
+-    @override
+-    def name(self) -> str:
+-        """Return the entity name (follows location renames)."""
+-        return f"Reset {self._evo_device.location.name} DHW"
++    _evo_device: evo.HotWater
+ 
+ 
+ class EvoZoneResetButton(EvoResetButtonBase):
+     """Button entity for zone override reset."""
+ 
++    _attr_translation_key = "zone_reset"
++
+     _evo_device: evo.Zone
+ 
+     def __init__(
+@@ -106,9 +121,3 @@ class EvoZoneResetButton(EvoResetButtonBase):
+         super().__init__(coordinator, evo_device)
+ 
+         self._attr_unique_id = f"{unique_zone_id(evo_device)}_reset"
+-
+-    @property
+-    @override
+-    def name(self) -> str:
+-        """Return the entity name (follows zone renames)."""
+-        return f"Reset {self._evo_device.name}"
+diff --git a/homeassistant/components/evohome/climate.py b/homeassistant/components/evohome/climate.py
+index 6f6bb69f98..986c70690c 100644
+--- a/homeassistant/components/evohome/climate.py
++++ b/homeassistant/components/evohome/climate.py
+@@ -1,5 +1,10 @@
+ """Support for Climate entities of the Evohome integration."""
+ 
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from . import EvoConfigEntry
++
+ from datetime import datetime, timedelta
+ import logging
+ from typing import Any, override
+@@ -33,10 +38,9 @@ from homeassistant.const import ATTR_TEMPERATURE, PRECISION_TENTHS, UnitOfTemper
+ from homeassistant.core import HomeAssistant, callback
+ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+ from homeassistant.helpers.entity_platform import AddEntitiesCallback
+-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+ from homeassistant.util import dt as dt_util
+ 
+-from .const import DOMAIN, EVOHOME_DATA, NEXT_SP_FROM, EvoService
++from .const import DOMAIN, NEXT_SP_FROM, EvoService
+ from .coordinator import EvoDataUpdateCoordinator
+ from .entity import EvoChild, EvoEntity, is_valid_zone, unique_zone_id
+ from .helpers import as_snake_case
+@@ -62,19 +66,15 @@ EVO_PRESET_TO_HA = {
+ HA_PRESET_TO_EVO = {v: k for k, v in EVO_PRESET_TO_HA.items()}
+ 
+ 
+-async def async_setup_platform(
++async def async_setup_entry(
+     hass: HomeAssistant,
+-    _: ConfigType,
++    entry: EvoConfigEntry,
+     async_add_entities: AddEntitiesCallback,
+-    discovery_info: DiscoveryInfoType | None = None,
+ ) -> None:
+     """Set up the climate platform for Evohome."""
+ 
+-    if discovery_info is None:
+-        return
+-
+-    coordinator = hass.data[EVOHOME_DATA].coordinator
+-    tcs = hass.data[EVOHOME_DATA].tcs
++    coordinator = entry.runtime_data.coordinator
++    tcs = coordinator.tcs
+ 
+     _LOGGER.debug(
+         "Found the Location/Controller (%s), id=%s, name=%s (location_idx=%s)",
+@@ -152,6 +152,8 @@ class EvoZone(EvoChild, EvoClimateEntity):
+ 
+     _attr_preset_modes = list(HA_PRESET_TO_EVO)
+ 
++    _attr_translation_key = "zone"
++
+     _evo_device: evo.Zone
+     _evo_id_attr = "zone_id"
+     _evo_state_attr_names = (SZ_SETPOINT_STATUS, SZ_TEMPERATURE_STATUS)
+@@ -200,12 +202,6 @@ class EvoZone(EvoChild, EvoClimateEntity):
+             self._evo_device.set_temperature(temperature, until=until)
+         )
+ 
+-    @property
+-    @override
+-    def name(self) -> str:
+-        """Return the name of the evohome entity."""
+-        return self._evo_device.name  # zones can be renamed
+-
+     @property
+     @override
+     def hvac_mode(self) -> HVACMode | None:
+@@ -330,6 +326,8 @@ class EvoController(EvoClimateEntity):
+     _attr_icon = "mdi:thermostat-box"
+     _attr_precision = PRECISION_TENTHS
+ 
++    _attr_translation_key = "controller"
++
+     _evo_device: evo.ControlSystem
+     _evo_id_attr = "system_id"
+     _evo_state_attr_names = (SZ_SYSTEM_MODE_STATUS,)
+@@ -342,7 +340,6 @@ class EvoController(EvoClimateEntity):
+         super().__init__(coordinator, evo_device)
+ 
+         self._attr_unique_id = evo_device.id
+-        self._attr_name = evo_device.location.name
+ 
+         self._evo_modes = {
+             m[SZ_SYSTEM_MODE].value: m for m in evo_device.allowed_system_modes
+diff --git a/homeassistant/components/evohome/config_flow.py b/homeassistant/components/evohome/config_flow.py
+new file mode 100644
+index 0000000000..3906e6fc69
+--- /dev/null
++++ b/homeassistant/components/evohome/config_flow.py
+@@ -0,0 +1,234 @@
++"""UI setup, legacy import, reauthentication, and options for Evohome."""
++
++from typing import Any, override
++
++from aiohttp import ClientError
++import evohomeasync2 as evo
++import probatio
++
++from homeassistant.config_entries import (
++    ConfigEntry,
++    ConfigFlow,
++    ConfigFlowResult,
++    OptionsFlow,
++)
++from homeassistant.const import CONF_PASSWORD, CONF_SCAN_INTERVAL, CONF_USERNAME
++from homeassistant.core import callback
++from homeassistant.helpers import issue_registry as ir
++from homeassistant.helpers.aiohttp_client import async_get_clientsession
++
++from .const import CONF_LOCATION_IDX, DOMAIN, STORAGE_KEY
++from .storage import TokenManager
++
++
++class EvohomeConfigFlow(ConfigFlow, domain=DOMAIN):
++    """Configure a single account/controller, matching the legacy scope."""
++
++    VERSION = 1
++
++    async def _async_discover(
++        self, data: dict[str, Any], *, use_legacy_cache: bool = False
++    ) -> list[tuple[int, evo.Location, evo.ControlSystem]]:
++        manager = TokenManager(
++            self.hass,
++            data[CONF_USERNAME],
++            data[CONF_PASSWORD],
++            async_get_clientsession(self.hass),
++            store_key=None,
++            legacy_store_key=STORAGE_KEY if use_legacy_cache else None,
++        )
++        client = evo.EvohomeClient(manager)
++        await client.setup()
++        return [
++            (idx, loc, system)
++            for idx, loc in enumerate(client.locations)
++            for gateway in loc.gateways
++            for system in gateway.systems
++        ]
++
++    @override
++    async def async_step_user(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        """Validate account credentials."""
++        if self._async_current_entries():
++            return self.async_abort(reason="single_instance_allowed")
++        errors = {}
++        if user_input is not None:
++            try:
++                self._systems = await self._async_discover(user_input)
++            except evo.BadUserCredentialsError:
++                errors["base"] = "invalid_auth"
++            except evo.EvohomeError, ClientError, TimeoutError:
++                errors["base"] = "cannot_connect"
++            else:
++                if not self._systems:
++                    return self.async_abort(reason="no_systems")
++                self._credentials = user_input
++                return await self.async_step_controller()
++        return self.async_show_form(
++            step_id="user",
++            data_schema=probatio.Schema(
++                {
++                    probatio.Required(CONF_USERNAME): str,
++                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
++                }
++            ),
++            errors=errors,
++        )
++
++    async def async_step_controller(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        """Choose the controller to configure."""
++        if user_input is not None:
++            selected = next(
++                (r for r in self._systems if r[2].id == user_input["system_id"]), None
++            )
++            if selected is None:
++                return self.async_abort(reason="no_systems")
++            idx, loc, system = selected
++            await self.async_set_unique_id(f"{loc.id}_{system.id}")
++            self._abort_if_unique_id_configured()
++            if self._async_current_entries():
++                return self.async_abort(reason="single_instance_allowed")
++            return self.async_create_entry(
++                title=loc.name,
++                data={
++                    **self._credentials,
++                    CONF_LOCATION_IDX: idx,
++                    "location_id": loc.id,
++                    "system_id": system.id,
++                },
++                options={CONF_SCAN_INTERVAL: 300},
++            )
++        choices = {r[2].id: f"{r[1].name} ({r[2].id})" for r in self._systems}
++        return self.async_show_form(
++            step_id="controller",
++            data_schema=probatio.Schema(
++                {
++                    probatio.Required("system_id"): probatio.In(choices),
++                }
++            ),
++        )
++
++    async def async_step_import(self, user_input: dict[str, Any]) -> ConfigFlowResult:
++        """Import a legacy YAML controller."""
++        if self._async_current_entries():
++            self._yaml_issue()
++            return self.async_abort(reason="single_instance_allowed")
++        try:
++            systems = await self._async_discover(user_input, use_legacy_cache=True)
++        except evo.BadUserCredentialsError:
++            return self.async_abort(reason="invalid_auth")
++        except evo.EvohomeError, ClientError, TimeoutError:
++            return self.async_abort(reason="cannot_connect")
++        selected = next(
++            (r for r in systems if r[0] == user_input.get(CONF_LOCATION_IDX, 0)), None
++        )
++        if selected is None:
++            return self.async_abort(reason="no_systems")
++        idx, loc, system = selected
++        await self.async_set_unique_id(f"{loc.id}_{system.id}")
++        self._abort_if_unique_id_configured()
++        if self._async_current_entries():
++            return self.async_abort(reason="single_instance_allowed")
++        self._yaml_issue()
++        return self.async_create_entry(
++            title=loc.name,
++            data={
++                CONF_USERNAME: user_input[CONF_USERNAME],
++                CONF_PASSWORD: user_input[CONF_PASSWORD],
++                CONF_LOCATION_IDX: idx,
++                "location_id": loc.id,
++                "system_id": system.id,
++            },
++            options={
++                CONF_SCAN_INTERVAL: min(
++                    3600, max(180, user_input.get(CONF_SCAN_INTERVAL, 300))
++                )
++            },
++        )
++
++    @callback
++    def _yaml_issue(self) -> None:
++        ir.async_create_issue(
++            self.hass,
++            DOMAIN,
++            "yaml_imported",
++            is_fixable=False,
++            severity=ir.IssueSeverity.WARNING,
++            translation_key="yaml_imported",
++        )
++
++    async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
++        """Start reauthentication for the current entry."""
++        return await self.async_step_reauth_confirm()
++
++    async def async_step_reauth_confirm(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        """Validate replacement credentials for the same controller."""
++        entry = self._get_reauth_entry()
++        errors = {}
++        if user_input is not None:
++            try:
++                systems = await self._async_discover({**entry.data, **user_input})
++            except evo.BadUserCredentialsError:
++                errors["base"] = "invalid_auth"
++            except evo.EvohomeError, ClientError, TimeoutError:
++                errors["base"] = "cannot_connect"
++            else:
++                if not any(
++                    loc.id == entry.data["location_id"]
++                    and system.id == entry.data["system_id"]
++                    for _, loc, system in systems
++                ):
++                    errors["base"] = "wrong_controller"
++                else:
++                    return self.async_update_reload_and_abort(
++                        entry, data_updates=user_input
++                    )
++        return self.async_show_form(
++            step_id="reauth_confirm",
++            data_schema=probatio.Schema(
++                {
++                    probatio.Required(
++                        CONF_USERNAME, default=entry.data[CONF_USERNAME]
++                    ): str,
++                    probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
++                }
++            ),
++            errors=errors,
++        )
++
++    @staticmethod
++    @callback
++    @override
++    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
++        """Create the polling options flow."""
++        return EvohomeOptionsFlow()
++
++
++class EvohomeOptionsFlow(OptionsFlow):
++    """Change polling without YAML; conservative cloud polling minimum."""
++
++    async def async_step_init(
++        self, user_input: dict[str, Any] | None = None
++    ) -> ConfigFlowResult:
++        """Set the polling interval."""
++        if user_input is not None:
++            return self.async_create_entry(title="", data=user_input)
++        return self.async_show_form(
++            step_id="init",
++            data_schema=probatio.Schema(
++                {
++                    probatio.Required(
++                        CONF_SCAN_INTERVAL,
++                        default=self.config_entry.options.get(CONF_SCAN_INTERVAL, 300),
++                    ): probatio.All(
++                        probatio.Coerce(int), probatio.Range(min=180, max=3600)
++                    ),
++                }
++            ),
++        )
+diff --git a/homeassistant/components/evohome/coordinator.py b/homeassistant/components/evohome/coordinator.py
+index e03f4cb413..1b387cb63c 100644
+--- a/homeassistant/components/evohome/coordinator.py
++++ b/homeassistant/components/evohome/coordinator.py
+@@ -27,9 +27,10 @@ from evohomeasync2.typedefs import (
+     EvoZonScheduleDayOfWeekT,
+ )
+ 
++from homeassistant.config_entries import ConfigEntry
+ from homeassistant.const import CONF_SCAN_INTERVAL
+ from homeassistant.core import HomeAssistant
+-from homeassistant.exceptions import HomeAssistantError
++from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+ from homeassistant.util import dt as dt_util
+ 
+@@ -58,6 +59,9 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+         name: str,
+         update_interval: timedelta,
+         location_idx: int,
++        location_id: str,
++        system_id: str,
++        config_entry: ConfigEntry,
+         client_v1: ec1.EvohomeClient | None = None,
+     ) -> None:
+         """Class to manage fetching data."""
+@@ -65,7 +69,7 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+         super().__init__(
+             hass,
+             logger,
+-            config_entry=None,
++            config_entry=config_entry,
+             name=name,
+             update_interval=update_interval,
+         )
+@@ -74,6 +78,8 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+         self.client_v1 = client_v1
+ 
+         self.loc_idx = location_idx
++        self.location_id = location_id
++        self.system_id = system_id
+ 
+         self.data: EvoLocStatusT = None  # type: ignore[assignment]
+         self.temps: dict[str, float | None] = {}
+@@ -81,22 +87,6 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+         self._first_refresh_done = False  # get schedules only after first refresh
+         self._schedules_fetched: dict[str, datetime] = {}  # by DHW/zone id
+ 
+-    # our version of async_config_entry_first_refresh()...
+-    async def async_first_refresh(self) -> None:
+-        """Refresh data for the first time when integration is setup.
+-
+-        This integration does not have config flow, so it is inappropriate to
+-        invoke `async_config_entry_first_refresh()`.
+-        """
+-
+-        # can't replicate `if not await self.__wrap_async_setup():` (is mangled), so...
+-        if not await self._DataUpdateCoordinator__wrap_async_setup():  # type: ignore[attr-defined]
+-            return
+-
+-        await self._async_refresh(
+-            log_failures=False, raise_on_auth_failed=True, raise_on_entry_error=True
+-        )
+-
+     @override
+     async def _async_setup(self) -> None:
+         """Set up the coordinator.
+@@ -106,23 +96,29 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+ 
+         try:
+             await self.client.setup()  # only config for now
++        except ec2.BadUserCredentialsError as err:
++            raise ConfigEntryAuthFailed from err
+         except ec2.EvohomeError as err:
+             raise UpdateFailed(err) from err
+ 
+-        try:
+-            self.loc = self.client.locations[self.loc_idx]
+-        except IndexError as err:
+-            raise UpdateFailed(
+-                f"""
+-                    Config error: 'location_idx' = {self.loc_idx},
+-                    but the valid range is 0-{len(self.client.locations) - 1}.
+-                    Unable to continue. Fix any configuration errors and restart HA
+-                """
+-            ) from err
+-
+-        if (tcs := self.loc.tcs) is None:
+-            raise UpdateFailed(f"Config error: location {self.loc.id} has no TCS")
+-        self.tcs = tcs
++        location = next(
++            (loc for loc in self.client.locations if loc.id == self.location_id), None
++        )
++        if location is None:
++            raise UpdateFailed("The configured location is no longer available")
++        self.loc = location
++        controller = next(
++            (
++                system
++                for gateway in location.gateways
++                for system in gateway.systems
++                if system.id == self.system_id
++            ),
++            None,
++        )
++        if controller is None:
++            raise UpdateFailed("The configured controller is no longer available")
++        self.tcs = controller
+ 
+         if self.logger.isEnabledFor(logging.DEBUG):
+             loc_info = {
+@@ -162,8 +158,19 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+         try:
+             result = await client_api
+ 
+-        except ec2.AuthenticationFailedError:
+-            raise
++        except ec2.BadUserCredentialsError as err:
++            if self.config_entry is not None:
++                self.config_entry.async_start_reauth(self.hass)
++            raise HomeAssistantError(
++                translation_domain=DOMAIN, translation_key="authentication_failed"
++            ) from err
++
++        except ec2.AuthenticationFailedError as err:
++            raise HomeAssistantError(
++                translation_domain=DOMAIN,
++                translation_key="api_call_failed",
++                translation_placeholders={"error": str(err)},
++            ) from err
+ 
+         except ec2.ApiCallFailedError as err:
+             raise HomeAssistantError(
+@@ -193,6 +200,7 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+                 ),
+                 err,
+             )
++            self.temps = {}
+             self.client_v1 = None
+ 
+         except ec1.EvohomeError as err:
+@@ -219,6 +227,8 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+         try:
+             status = await self.loc.get_status()
+ 
++        except ec2.BadUserCredentialsError as err:
++            raise ConfigEntryAuthFailed from err
+         except ec2.ApiCallFailedError as err:
+             if err.status != HTTPStatus.TOO_MANY_REQUESTS:
+                 raise UpdateFailed(err) from err
+diff --git a/homeassistant/components/evohome/device.py b/homeassistant/components/evohome/device.py
+new file mode 100644
+index 0000000000..e20a221c01
+--- /dev/null
++++ b/homeassistant/components/evohome/device.py
+@@ -0,0 +1,38 @@
++"""Device registry metadata shared by entities for a controller or zone."""
++
++import evohomeasync2 as evo
++
++from homeassistant.core import HomeAssistant
++from homeassistant.helpers import area_registry as ar, entity_registry as er
++from homeassistant.helpers.device_registry import DeviceInfo
++
++from .const import DOMAIN
++
++
++def device_info(
++    hass: HomeAssistant, device: evo.Zone | evo.HotWater | evo.ControlSystem, kind: str
++) -> DeviceInfo:
++    """Group entities without changing existing platform unique IDs."""
++    device_id = device.id
++    if isinstance(device, evo.Zone) and device.id == device.tcs.id:
++        device_id += "z"
++    name = (
++        device.location.name if isinstance(device, evo.ControlSystem) else device.name
++    )
++    info = DeviceInfo(
++        identifiers={(DOMAIN, f"{kind}_{device_id}")},
++        manufacturer="Honeywell",
++        name=name,
++        model=str(getattr(device, "model", kind)),
++    )
++    # Reuse the room already assigned to the legacy climate entity as a suggestion.
++    # Device registry preserves a user's existing device-area choice.
++    registry = er.async_get(hass)
++    platform = "water_heater" if isinstance(device, evo.HotWater) else "climate"
++    entity_id = registry.async_get_entity_id(platform, DOMAIN, device_id)
++    entity = registry.async_get(entity_id) if entity_id else None
++    if entity and entity.area_id:
++        area = ar.async_get(hass).async_get_area(entity.area_id)
++        if area:
++            info["suggested_area"] = area.name
++    return info
+diff --git a/homeassistant/components/evohome/diagnostics.py b/homeassistant/components/evohome/diagnostics.py
+new file mode 100644
+index 0000000000..36541f099f
+--- /dev/null
++++ b/homeassistant/components/evohome/diagnostics.py
+@@ -0,0 +1,28 @@
++"""Minimal diagnostics without credentials, tokens, location names, or API bodies."""
++
++from typing import TYPE_CHECKING, Any
++
++from homeassistant.core import HomeAssistant
++
++if TYPE_CHECKING:
++    from . import EvoConfigEntry
++
++
++async def async_get_config_entry_diagnostics(
++    hass: HomeAssistant, entry: EvoConfigEntry
++) -> dict[str, Any]:
++    """Expose only operational counters and status, using an allow list."""
++    coord = entry.runtime_data.coordinator
++    return {
++        "entry_version": entry.version,
++        "poll_seconds": coord.update_interval.total_seconds()
++        if coord.update_interval is not None
++        else None,
++        "last_update_success": coord.last_update_success,
++        "last_exception_type": type(coord.last_exception).__name__
++        if coord.last_exception
++        else None,
++        "zone_count": len(coord.tcs.zones),
++        "has_hot_water": coord.tcs.hotwater is not None,
++        "high_precision_enabled": coord.client_v1 is not None,
++    }
+diff --git a/homeassistant/components/evohome/entity.py b/homeassistant/components/evohome/entity.py
+index 2ff09cfafa..2b134ff5b7 100644
+--- a/homeassistant/components/evohome/entity.py
++++ b/homeassistant/components/evohome/entity.py
+@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
+ 
+ from .const import NEXT_SP_FROM, THIS_SP_FROM
+ from .coordinator import EvoDataUpdateCoordinator
++from .device import device_info
+ 
+ _LOGGER = logging.getLogger(__name__)
+ 
+@@ -59,6 +60,8 @@ def unique_zone_id(evo_device: evo.Zone) -> str:
+ class EvoEntity(CoordinatorEntity[EvoDataUpdateCoordinator]):
+     """Base for Evohome's Climate & WaterHeater entities."""
+ 
++    _attr_has_entity_name = True
++
+     _evo_device: evo.ControlSystem | evo.HotWater | evo.Zone
+     _evo_id_attr: str
+     _evo_state_attr_names: tuple[str, ...]
+@@ -71,6 +74,12 @@ class EvoEntity(CoordinatorEntity[EvoDataUpdateCoordinator]):
+         """Initialize an evohome-compatible entity (TCS, DHW, zone)."""
+         super().__init__(coordinator, context=evo_device.id)
+         self._evo_device = evo_device
++        kind = (
++            "zone"
++            if isinstance(evo_device, evo.Zone)
++            else ("dhw" if isinstance(evo_device, evo.HotWater) else "system")
++        )
++        self._attr_device_info = device_info(coordinator.hass, evo_device, kind)
+ 
+         self._device_state_attrs: dict[str, Any] = {}
+ 
+diff --git a/homeassistant/components/evohome/icons.json b/homeassistant/components/evohome/icons.json
+index 87a3d86747..19ab3f7951 100644
+--- a/homeassistant/components/evohome/icons.json
++++ b/homeassistant/components/evohome/icons.json
+@@ -13,9 +13,15 @@
+     }
+   },
+   "services": {
++    "clear_zone_override": {
++      "service": "mdi:motion-sensor-off"
++    },
+     "refresh_system": {
+       "service": "mdi:refresh"
+     },
++    "reset_system": {
++      "service": "mdi:refresh"
++    },
+     "set_dhw_override": {
+       "service": "mdi:water-boiler"
+     },
+diff --git a/homeassistant/components/evohome/manifest.json b/homeassistant/components/evohome/manifest.json
+index de31bff231..2e1ac11199 100644
+--- a/homeassistant/components/evohome/manifest.json
++++ b/homeassistant/components/evohome/manifest.json
+@@ -3,9 +3,12 @@
+   "name": "Honeywell Total Connect Comfort (Europe)",
+   "categories": ["climate.thermostats_heating"],
+   "codeowners": ["@zxdavb"],
++  "config_flow": true,
+   "documentation": "https://www.home-assistant.io/integrations/evohome",
++  "integration_type": "hub",
+   "iot_class": "cloud_polling",
+   "loggers": ["evohomeasync", "evohomeasync2"],
+   "quality_scale": "legacy",
+-  "requirements": ["evohome-async==3.1.0"]
++  "requirements": ["evohome-async==3.1.0"],
++  "single_config_entry": true
+ }
+diff --git a/homeassistant/components/evohome/sensor.py b/homeassistant/components/evohome/sensor.py
+new file mode 100644
+index 0000000000..405cefd899
+--- /dev/null
++++ b/homeassistant/components/evohome/sensor.py
+@@ -0,0 +1,72 @@
++"""Measured zone temperatures, selectable as Home Assistant area sensors."""
++
++from math import isfinite
++from typing import TYPE_CHECKING, override
++
++import evohomeasync2 as evo
++
++from homeassistant.components.sensor import (
++    SensorDeviceClass,
++    SensorEntity,
++    SensorStateClass,
++)
++from homeassistant.const import UnitOfTemperature
++from homeassistant.core import HomeAssistant
++from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
++from homeassistant.helpers.update_coordinator import CoordinatorEntity
++
++from .coordinator import EvoDataUpdateCoordinator
++from .device import device_info
++from .entity import is_valid_zone, unique_zone_id
++
++if TYPE_CHECKING:
++    from . import EvoConfigEntry
++
++
++async def async_setup_entry(
++    hass: HomeAssistant,
++    entry: EvoConfigEntry,
++    async_add_entities: AddConfigEntryEntitiesCallback,
++) -> None:
++    """Expose a measured temperature for each supported heating zone."""
++    coordinator = entry.runtime_data.coordinator
++    async_add_entities(
++        [
++            EvoTemperatureSensor(coordinator, zone)
++            for zone in coordinator.tcs.zones
++            if is_valid_zone(zone)
++        ]
++    )
++
++
++class EvoTemperatureSensor(CoordinatorEntity[EvoDataUpdateCoordinator], SensorEntity):
++    """Use the same measured temperature source as the zone climate entity."""
++
++    _attr_device_class = SensorDeviceClass.TEMPERATURE
++    _attr_state_class = SensorStateClass.MEASUREMENT
++    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
++    _attr_suggested_display_precision = 1
++    _attr_has_entity_name = True
++    _attr_translation_key = "temperature"
++
++    def __init__(self, coordinator: EvoDataUpdateCoordinator, zone: evo.Zone) -> None:
++        """Initialize the measured-temperature sensor."""
++        super().__init__(coordinator, context=zone.id)
++        self._zone = zone
++        self._attr_unique_id = f"{unique_zone_id(zone)}_temperature"
++        self._attr_device_info = device_info(coordinator.hass, zone, "zone")
++
++    @property
++    @override
++    def native_value(self) -> float | None:
++        value = self.coordinator.temps.get(self._zone.id)
++        if value is None:
++            value = self._zone.temperature
++        if value is None or not isfinite(value):
++            return None
++        return value
++
++    @property
++    @override
++    def available(self) -> bool:
++        return super().available and self.native_value is not None
+diff --git a/homeassistant/components/evohome/services.py b/homeassistant/components/evohome/services.py
+index e4b8554c85..a648de14f3 100644
+--- a/homeassistant/components/evohome/services.py
++++ b/homeassistant/components/evohome/services.py
+@@ -1,5 +1,10 @@
+ """Service handlers for the Evohome integration."""
+ 
++from typing import TYPE_CHECKING, cast
++
++if TYPE_CHECKING:
++    from . import EvoConfigEntry
++
+ from datetime import timedelta
+ from typing import Any, Final
+ 
+@@ -9,10 +14,12 @@ import probatio
+ from homeassistant.components.climate import DOMAIN as CLIMATE_DOMAIN
+ from homeassistant.components.water_heater import DOMAIN as WATER_HEATER_DOMAIN
+ from homeassistant.core import HomeAssistant, ServiceCall, callback
++from homeassistant.exceptions import ServiceValidationError
+ from homeassistant.helpers import config_validation as cv, service
+ from homeassistant.helpers.service import verify_domain_control
+ 
+-from .const import DOMAIN, EVOHOME_DATA, REFRESH_BREAKS_IN_HA_VERSION, EvoService
++from .const import DOMAIN, REFRESH_BREAKS_IN_HA_VERSION, EvoService
++from .coordinator import EvoDataUpdateCoordinator
+ from .helpers import async_create_deprecation_issue_once
+ 
+ # Controller service schemas (registered as entity services)
+@@ -93,6 +100,18 @@ def _register_dhw_entity_services(hass: HomeAssistant) -> None:
+ def async_setup_services(hass: HomeAssistant) -> None:
+     """Register the Evohome services."""
+ 
++    def get_coordinator() -> EvoDataUpdateCoordinator:
++        entries = [
++            entry
++            for entry in hass.config_entries.async_entries(DOMAIN)
++            if entry.state.value == "loaded"
++        ]
++        if len(entries) != 1:
++            raise ServiceValidationError(
++                "Exactly one loaded Evohome controller is required"
++            )
++        return cast("EvoConfigEntry", entries[0]).runtime_data.coordinator
++
+     @verify_domain_control(DOMAIN)
+     async def force_refresh(call: ServiceCall) -> None:
+         """Obtain the latest state data via the vendor's RESTful API."""
+@@ -101,7 +120,7 @@ def async_setup_services(hass: HomeAssistant) -> None:
+             "deprecated_refresh_system_service",
+             REFRESH_BREAKS_IN_HA_VERSION,
+         )
+-        await hass.data[EVOHOME_DATA].coordinator.async_refresh()
++        await get_coordinator().async_refresh()
+ 
+     hass.services.async_register(DOMAIN, EvoService.REFRESH_SYSTEM, force_refresh)
+ 
+diff --git a/homeassistant/components/evohome/storage.py b/homeassistant/components/evohome/storage.py
+index 32e86a22fd..f5e1055e87 100644
+--- a/homeassistant/components/evohome/storage.py
++++ b/homeassistant/components/evohome/storage.py
+@@ -38,12 +38,17 @@ class TokenManager(AbstractTokenManager, AbstractSessionManager):
+         self,
+         hass: HomeAssistant,
+         *args: Any,
++        store_key: str | None = STORAGE_KEY,
++        legacy_store_key: str | None = None,
+         **kwargs: Any,
+     ) -> None:
+         """Initialise the token manager."""
+         super().__init__(*args, **kwargs)
+ 
+-        self._store = Store(hass, STORAGE_VER, STORAGE_KEY)  # type: ignore[var-annotated]
++        self._store = Store(hass, STORAGE_VER, store_key) if store_key else None  # type: ignore[var-annotated]
++        self._legacy_store: Store[_TokenStoreT] | None = (
++            Store(hass, STORAGE_VER, legacy_store_key) if legacy_store_key else None
++        )
+         self._store_initialized = False  # True once cache loaded first time
+ 
+     @override
+@@ -76,12 +81,21 @@ class TokenManager(AbstractTokenManager, AbstractSessionManager):
+         Assumes single reader/writer. Reads only once, at initialization.
+         """
+ 
+-        cache: _TokenStoreT = await self._store.async_load() or {}  # type: ignore[assignment]
++        cache: _TokenStoreT | None = (
++            await self._store.async_load() if self._store else None
++        )
++        migrated = False
++        if cache is None and self._legacy_store is not None:
++            cache = await self._legacy_store.async_load()
++            migrated = bool(cache)
+         self._store_initialized = True
+ 
+         if not cache or cache["username"] != self._client_id:
+             return
+ 
++        if migrated and self._store is not None:
++            await self._store.async_save(cache)
++
+         if SZ_SESSION_ID in cache:
+             self._import_session_id(cache)  # type: ignore[arg-type]
+         self._import_access_token(cache)
+@@ -119,4 +133,5 @@ class TokenManager(AbstractTokenManager, AbstractSessionManager):
+         if self._session_id:
+             cache |= self._export_session_id()
+ 
+-        await self._store.async_save(cache)
++        if self._store is not None:
++            await self._store.async_save(cache)
+diff --git a/homeassistant/components/evohome/strings.json b/homeassistant/components/evohome/strings.json
+index 0a9608a27f..6c876308bd 100644
+--- a/homeassistant/components/evohome/strings.json
++++ b/homeassistant/components/evohome/strings.json
+@@ -1,8 +1,92 @@
+ {
++  "config": {
++    "abort": {
++      "already_configured": "This controller is already configured.",
++      "cannot_connect": "YAML import could not connect. Retry after the service recovers, or configure from the UI.",
++      "invalid_auth": "YAML import failed: credentials were rejected. Configure the integration from the UI.",
++      "no_systems": "No compatible controller was found for the selected location.",
++      "reauth_successful": "Your credentials have been updated.",
++      "single_instance_allowed": "Only one Evohome controller can be configured in this alpha."
++    },
++    "error": {
++      "cannot_connect": "Unable to connect to Honeywell. Try again later.",
++      "invalid_auth": "The account credentials were rejected.",
++      "wrong_controller": "This account cannot access the configured controller."
++    },
++    "step": {
++      "controller": {
++        "data": {
++          "system_id": "Controller"
++        },
++        "data_description": {
++          "system_id": "The controller this integration will manage."
++        },
++        "title": "Choose your heating controller"
++      },
++      "reauth_confirm": {
++        "data": {
++          "password": "Password",
++          "username": "Email address"
++        },
++        "data_description": {
++          "password": "The current password for that account.",
++          "username": "The email address with access to your existing controller."
++        },
++        "description": "Re-enter credentials for the same controller.",
++        "title": "Reconnect your TCC account"
++      },
++      "user": {
++        "data": {
++          "password": "Password",
++          "username": "Email address"
++        },
++        "data_description": {
++          "password": "Your TCC account password, stored locally in Home Assistant.",
++          "username": "The email address used for the international TCC service."
++        },
++        "description": "Use your international TCC account. Setup only reads configuration; it does not change heating.",
++        "title": "Connect to Honeywell Total Connect Comfort (Europe)"
++      }
++    }
++  },
++  "entity": {
++    "button": {
++      "controller_reset": {
++        "name": "Reset all schedules"
++      },
++      "dhw_reset": {
++        "name": "Reset schedule"
++      },
++      "zone_reset": {
++        "name": "Reset schedule"
++      }
++    },
++    "climate": {
++      "controller": {
++        "name": "Heating controller"
++      },
++      "zone": {
++        "name": "Heating"
++      }
++    },
++    "sensor": {
++      "temperature": {
++        "name": "Temperature"
++      }
++    },
++    "water_heater": {
++      "hot_water": {
++        "name": "Hot water"
++      }
++    }
++  },
+   "exceptions": {
+     "api_call_failed": {
+       "message": "The request to the vendor's API failed: {error}"
+     },
++    "authentication_failed": {
++      "message": "Authentication failed. Reauthenticate the Evohome integration."
++    },
+     "controller_only_service": {
+       "message": "Only Evohome controllers support the `{service}` action"
+     },
+@@ -29,6 +113,28 @@
+     "deprecated_refresh_system_service": {
+       "description": "The `refresh_system` action is deprecated and will stop working in Home Assistant {breaks_in_ha_version}. Instead, use the `homeassistant.update_entity` action, targeting the controller's climate entity.",
+       "title": "Evohome 'Refresh system' action is deprecated"
++    },
++    "yaml_import_failed": {
++      "description": "The legacy Evohome configuration could not be imported ({reason}). Correct the YAML and restart Home Assistant, or remove the Evohome YAML and add the integration in Devices & services.",
++      "title": "Evohome YAML import failed"
++    },
++    "yaml_imported": {
++      "description": "Evohome has been imported or is already configured in Devices & services. Verify the controller and zones before removing the evohome section from configuration.yaml. Do not remove the integration entry. Keep a backup for rollback.",
++      "title": "Remove legacy Evohome YAML after verification"
++    }
++  },
++  "options": {
++    "step": {
++      "init": {
++        "data": {
++          "scan_interval": "Polling interval (seconds)"
++        },
++        "data_description": {
++          "scan_interval": "How often to poll Honeywell, from 180 to 3600 seconds."
++        },
++        "description": "Default: 300 seconds. Short polling can trigger Honeywell rate limits.",
++        "title": "Cloud polling"
++      }
+     }
+   },
+   "services": {
+diff --git a/homeassistant/components/evohome/water_heater.py b/homeassistant/components/evohome/water_heater.py
+index afcdcbc69e..dc3ad56a03 100644
+--- a/homeassistant/components/evohome/water_heater.py
++++ b/homeassistant/components/evohome/water_heater.py
+@@ -1,5 +1,10 @@
+ """Support for WaterHeater entities of the Evohome integration."""
+ 
++from typing import TYPE_CHECKING
++
++if TYPE_CHECKING:
++    from . import EvoConfigEntry
++
+ from datetime import timedelta
+ import logging
+ from typing import Any, override
+@@ -25,10 +30,9 @@ from homeassistant.const import (
+ )
+ from homeassistant.core import HomeAssistant
+ from homeassistant.helpers.entity_platform import AddEntitiesCallback
+-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+ from homeassistant.util import dt as dt_util
+ 
+-from .const import EVOHOME_DATA, NEXT_SP_FROM
++from .const import NEXT_SP_FROM
+ from .coordinator import EvoDataUpdateCoordinator
+ from .entity import EvoChild
+ 
+@@ -40,21 +44,18 @@ HA_STATE_TO_EVO = {STATE_AUTO: "", STATE_ON: EvoDhwState.ON, STATE_OFF: EvoDhwSt
+ EVO_STATE_TO_HA = {v: k for k, v in HA_STATE_TO_EVO.items() if k != ""}
+ 
+ 
+-async def async_setup_platform(
++async def async_setup_entry(
+     hass: HomeAssistant,
+-    _: ConfigType,
++    entry: EvoConfigEntry,
+     async_add_entities: AddEntitiesCallback,
+-    discovery_info: DiscoveryInfoType | None = None,
+ ) -> None:
+     """Set up the water heater platform for Evohome."""
+ 
+-    if discovery_info is None:
+-        return
+-
+-    coordinator = hass.data[EVOHOME_DATA].coordinator
+-    tcs = hass.data[EVOHOME_DATA].tcs
++    coordinator = entry.runtime_data.coordinator
++    tcs = coordinator.tcs
+ 
+-    assert tcs.hotwater is not None  # mypy check
++    if tcs.hotwater is None:
++        return
+ 
+     _LOGGER.debug(
+         "Adding: DhwController (%s), id=%s",
+@@ -80,6 +81,8 @@ class EvoDHW(EvoChild, WaterHeaterEntity):
+     )
+     _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+ 
++    _attr_translation_key = "hot_water"
++
+     _evo_device: evo.HotWater
+     _evo_id_attr = "dhw_id"
+     _evo_state_attr_names = (SZ_STATE_STATUS, SZ_TEMPERATURE_STATUS)
+@@ -92,7 +95,6 @@ class EvoDHW(EvoChild, WaterHeaterEntity):
+         super().__init__(coordinator, evo_device)
+ 
+         self._attr_unique_id = evo_device.id
+-        self._attr_name = evo_device.name  # is static
+ 
+         self._attr_precision = (
+             PRECISION_TENTHS if coordinator.client_v1 else PRECISION_WHOLE
+diff --git a/tests/components/evohome/conftest.py b/tests/components/evohome/conftest.py
+index d9070b922a..b54aefc995 100644
+--- a/tests/components/evohome/conftest.py
++++ b/tests/components/evohome/conftest.py
+@@ -1,9 +1,10 @@
+ """Fixtures and helpers for the evohome tests."""
+ 
+ from collections.abc import AsyncGenerator, Callable
++from contextlib import ExitStack
+ from datetime import timedelta, timezone
+ from http import HTTPMethod
+-from typing import Any
++from typing import Any, cast
+ from unittest.mock import MagicMock, patch
+ 
+ from evohomeasync2 import ControlSystem, EvohomeClient, HotWater, Zone
+@@ -15,7 +16,9 @@ from pytest_homeassistant.common import (
+     load_json_object_fixture,
+ )
+ 
++from homeassistant.components.evohome import EvoConfigEntry, EvoData
+ from homeassistant.components.evohome.const import DOMAIN
++from homeassistant.components.evohome.entity import is_valid_zone, unique_zone_id
+ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+ from homeassistant.core import HomeAssistant
+ from homeassistant.helpers import entity_registry as er
+@@ -142,6 +145,8 @@ async def setup_evohome(
+     hass: HomeAssistant,
+     config: ConfigType,
+     install: str = "default",
++    *,
++    seed_legacy: bool = True,
+ ) -> AsyncGenerator[MagicMock]:
+     """Set up the evohome integration and return its client.
+ 
+@@ -162,6 +167,7 @@ async def setup_evohome(
+     dt_util.set_default_time_zone(timezone(timedelta(minutes=utc_offset)))
+ 
+     with (
++        ExitStack() as instance_patches,
+         # patch("homeassistant.components.evohome.ec1.EvohomeClient",
+         #       return_value=None),
+         patch("homeassistant.components.evohome.ec2.EvohomeClient") as mock_client,
+@@ -172,18 +178,39 @@ async def setup_evohome(
+         patch("_evohome.auth.AbstractAuth._make_request", mock_make_request(install)),
+     ):
+         evo: EvohomeClient | None = None
++        legacy_seeded = False
+ 
+         def evohome_client(*args, **kwargs) -> EvohomeClient:
+             nonlocal evo
+-            evo = EvohomeClient(*args, **kwargs)
+-            return evo
++            current = EvohomeClient(*args, **kwargs)
++            evo = current
++            original_setup = current.setup
++
++            async def setup_and_seed(*args, **kwargs) -> None:
++                nonlocal legacy_seeded
++                await original_setup(*args, **kwargs)
++                if (
++                    seed_legacy
++                    and not legacy_seeded
++                    and loc_idx < len(current.locations)
++                ):
++                    controller = current.locations[loc_idx].tcs
++                    if controller is not None:
++                        await controller.location.get_status()
++                        seed_legacy_entities(hass, controller)
++                    legacy_seeded = True
++
++            instance_patches.enter_context(
++                patch.object(current, "setup", side_effect=setup_and_seed)
++            )
++            return current
+ 
+         mock_client.side_effect = evohome_client
+ 
+         assert await async_setup_component(hass, DOMAIN, {DOMAIN: config})
+         await hass.async_block_till_done()
+ 
+-        mock_client.assert_called_once()
++        assert mock_client.call_count == 2  # discovery then entry setup
+ 
+         assert isinstance(evo, EvohomeClient)
+         assert evo._token_manager.client_id == config[CONF_USERNAME]
+@@ -263,3 +290,30 @@ def entity_id(
+         return entity
+ 
+     return get_entity_id
++
++
++def get_evo_data(hass: HomeAssistant) -> EvoData:
++    """Return the entry-owned runtime data of the configured test controller."""
++    entries = hass.config_entries.async_entries(DOMAIN)
++    assert len(entries) == 1
++    return cast(EvoConfigEntry, entries[0]).runtime_data
++
++
++def seed_legacy_entities(hass: HomeAssistant, tcs: ControlSystem) -> None:
++    """Recreate the registry an existing YAML installation already has."""
++    registry = er.async_get(hass)
++
++    def add(domain: str, unique_id: str, name: str) -> None:
++        registry.async_get_or_create(
++            domain, DOMAIN, unique_id, suggested_object_id=name, original_name=name
++        )
++
++    add("climate", tcs.id, tcs.location.name)
++    add("button", f"{tcs.id}_reset", f"Reset {tcs.location.name}")
++    for zone in tcs.zones:
++        if is_valid_zone(zone):
++            add("climate", unique_zone_id(zone), zone.name)
++            add("button", f"{unique_zone_id(zone)}_reset", f"Reset {zone.name}")
++    if tcs.hotwater is not None:
++        add("water_heater", tcs.hotwater.id, tcs.hotwater.name)
++        add("button", f"{tcs.hotwater.id}_reset", f"Reset {tcs.location.name} DHW")
+diff --git a/tests/components/evohome/snapshots/test_button.ambr b/tests/components/evohome/snapshots/test_button.ambr
+index 747f4f8594..1f098d694d 100644
+--- a/tests/components/evohome/snapshots/test_button.ambr
++++ b/tests/components/evohome/snapshots/test_button.ambr
+@@ -2,7 +2,7 @@
+ # name: test_setup_platform[botched][button.reset_bathroom_dn-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Bathroom Dn',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_bathroom_dn',
+@@ -15,7 +15,7 @@
+ # name: test_setup_platform[botched][button.reset_dead_zone-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Dead Zone',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_dead_zone',
+@@ -28,7 +28,7 @@
+ # name: test_setup_platform[botched][button.reset_front_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Front Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_front_room',
+@@ -41,7 +41,7 @@
+ # name: test_setup_platform[botched][button.reset_kids_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Kids Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_kids_room',
+@@ -54,7 +54,7 @@
+ # name: test_setup_platform[botched][button.reset_kitchen-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Kitchen',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_kitchen',
+@@ -67,7 +67,7 @@
+ # name: test_setup_platform[botched][button.reset_main_bedroom-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Main Bedroom',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_main_bedroom',
+@@ -80,7 +80,7 @@
+ # name: test_setup_platform[botched][button.reset_main_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_main_room',
+@@ -93,7 +93,7 @@
+ # name: test_setup_platform[botched][button.reset_my_home-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home',
+@@ -106,7 +106,7 @@
+ # name: test_setup_platform[botched][button.reset_my_home_dhw-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home DHW',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home_dhw',
+@@ -119,7 +119,7 @@
+ # name: test_setup_platform[default][button.reset_bathroom_dn-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Bathroom Dn',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_bathroom_dn',
+@@ -132,7 +132,7 @@
+ # name: test_setup_platform[default][button.reset_dead_zone-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Dead Zone',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_dead_zone',
+@@ -145,7 +145,7 @@
+ # name: test_setup_platform[default][button.reset_front_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Front Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_front_room',
+@@ -158,7 +158,7 @@
+ # name: test_setup_platform[default][button.reset_kids_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Kids Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_kids_room',
+@@ -171,7 +171,7 @@
+ # name: test_setup_platform[default][button.reset_kitchen-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Kitchen',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_kitchen',
+@@ -184,7 +184,7 @@
+ # name: test_setup_platform[default][button.reset_main_bedroom-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Main Bedroom',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_main_bedroom',
+@@ -197,7 +197,7 @@
+ # name: test_setup_platform[default][button.reset_main_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_main_room',
+@@ -210,7 +210,7 @@
+ # name: test_setup_platform[default][button.reset_my_home-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home',
+@@ -223,7 +223,7 @@
+ # name: test_setup_platform[default][button.reset_my_home_dhw-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home DHW',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home_dhw',
+@@ -236,7 +236,7 @@
+ # name: test_setup_platform[default][button.reset_spare_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Spare Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Spare Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_spare_room',
+@@ -249,7 +249,7 @@
+ # name: test_setup_platform[h032585][button.reset_my_home-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home',
+@@ -262,7 +262,7 @@
+ # name: test_setup_platform[h032585][button.reset_thermostat-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset THERMOSTAT',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_thermostat',
+@@ -275,7 +275,7 @@
+ # name: test_setup_platform[h099625][button.reset_my_home-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home',
+@@ -288,7 +288,7 @@
+ # name: test_setup_platform[h099625][button.reset_thermostat-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset THERMOSTAT',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_thermostat',
+@@ -301,7 +301,7 @@
+ # name: test_setup_platform[h099625][button.reset_thermostat_2-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset THERMOSTAT',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_thermostat_2',
+@@ -314,7 +314,7 @@
+ # name: test_setup_platform[h139906][button.reset_thermostat-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Thermostat',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_thermostat',
+@@ -327,7 +327,7 @@
+ # name: test_setup_platform[h139906][button.reset_thermostat_2-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Thermostat 2',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat 2 Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_thermostat_2',
+@@ -340,7 +340,7 @@
+ # name: test_setup_platform[h139906][button.reset_vr-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Vr**********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Vr********** Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_vr',
+@@ -353,7 +353,7 @@
+ # name: test_setup_platform[h157546][button.reset_ba-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Ba******',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ba****** Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_ba',
+@@ -366,7 +366,7 @@
+ # name: test_setup_platform[h157546][button.reset_ka-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Ka*********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ka********* Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_ka',
+@@ -379,7 +379,7 @@
+ # name: test_setup_platform[h157546][button.reset_ka_2-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Ka*****',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ka***** Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_ka_2',
+@@ -392,7 +392,7 @@
+ # name: test_setup_platform[h157546][button.reset_kl-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Kl********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kl******** Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_kl',
+@@ -405,7 +405,7 @@
+ # name: test_setup_platform[h157546][button.reset_sl-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Sl********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Sl******** Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_sl',
+@@ -418,7 +418,7 @@
+ # name: test_setup_platform[h157546][button.reset_wo-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Wo*******',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Wo******* Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_wo',
+@@ -431,7 +431,7 @@
+ # name: test_setup_platform[minimal][button.reset_main_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_main_room',
+@@ -444,7 +444,7 @@
+ # name: test_setup_platform[minimal][button.reset_my_home-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home',
+@@ -457,7 +457,7 @@
+ # name: test_setup_platform[sys_004][button.reset_living_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Living room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Living room Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_living_room',
+@@ -470,7 +470,7 @@
+ # name: test_setup_platform[sys_004][button.reset_thermostat-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Thermostat',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_thermostat',
+@@ -483,7 +483,7 @@
+ # name: test_setup_platform[sys_006][button.reset_main_room-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_main_room',
+@@ -496,7 +496,7 @@
+ # name: test_setup_platform[sys_006][button.reset_my_home_1-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home 1',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home 1 Reset all schedules',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home_1',
+@@ -509,7 +509,7 @@
+ # name: test_setup_platform[sys_006][button.reset_my_home_1_dhw-state]
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Reset My Home 1 DHW',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Reset schedule',
+     }),
+     'context': <ANY>,
+     'entity_id': 'button.reset_my_home_1_dhw',
+diff --git a/tests/components/evohome/snapshots/test_climate.ambr b/tests/components/evohome/snapshots/test_climate.ambr
+index 95c358883c..4543a50568 100644
+--- a/tests/components/evohome/snapshots/test_climate.ambr
++++ b/tests/components/evohome/snapshots/test_climate.ambr
+@@ -195,7 +195,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -239,7 +239,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -287,7 +287,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: None,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -330,7 +330,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: None,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -377,7 +377,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -422,7 +422,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -471,7 +471,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -515,7 +515,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -563,7 +563,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -607,7 +607,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -655,7 +655,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -699,7 +699,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -747,7 +747,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -791,7 +791,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -839,7 +839,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.7,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -878,7 +878,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.7,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -917,7 +917,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Spare Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Spare Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -961,7 +961,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Spare Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Spare Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1009,7 +1009,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1053,7 +1053,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: None,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1096,7 +1096,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1145,7 +1145,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1189,7 +1189,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1233,7 +1233,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1277,7 +1277,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1325,7 +1325,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.8,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1364,7 +1364,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Bathroom Dn Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1408,7 +1408,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: None,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Dead Zone Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1451,7 +1451,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Front Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1496,7 +1496,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kids Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1540,7 +1540,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 20.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kitchen Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1584,7 +1584,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Bedroom Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1628,7 +1628,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1672,7 +1672,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.7,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1711,7 +1711,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Spare Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Spare Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1755,7 +1755,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1787,7 +1787,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1831,7 +1831,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1868,7 +1868,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1912,7 +1912,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 21.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'THERMOSTAT Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -1956,7 +1956,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 22.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2004,7 +2004,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 22.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat 2',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat 2 Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2048,7 +2048,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 22.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Vr**********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Vr********** Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2085,7 +2085,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 15.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ba******',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ba****** Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2129,7 +2129,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 16.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ka*********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ka********* Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2173,7 +2173,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 17.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ka*****',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Ka***** Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2217,7 +2217,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 17.1,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kl********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Kl******** Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2256,7 +2256,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 18.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Sl********',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Sl******** Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2300,7 +2300,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Wo*******',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Wo******* Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2344,7 +2344,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2388,7 +2388,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2427,7 +2427,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Living room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Living room Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2469,7 +2469,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Thermostat Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2513,7 +2513,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Main Room Heating',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+@@ -2565,7 +2565,7 @@
+   StateSnapshot({
+     'attributes': ReadOnlyDict({
+       <ClimateEntityStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 19.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home 1',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'My Home 1 Heating controller',
+       <ClimateEntityCapabilityAttribute.HVAC_MODES: 'hvac_modes'>: list([
+         <HVACMode.OFF: 'off'>,
+         <HVACMode.HEAT: 'heat'>,
+diff --git a/tests/components/evohome/snapshots/test_init.ambr b/tests/components/evohome/snapshots/test_init.ambr
+index f2c4a46ec1..71a07f69cc 100644
+--- a/tests/components/evohome/snapshots/test_init.ambr
++++ b/tests/components/evohome/snapshots/test_init.ambr
+@@ -10,6 +10,8 @@
+     'climate.name_3935922',
+     'climate.name_4368406',
+     'climate.summer_house',
++    'sensor.name_3935922_temperature',
++    'sensor.name_4368406_temperature',
+   ])
+ # ---
+ # name: test_setup_non_default_location[sys_004-location_idx_2]
+@@ -34,6 +36,15 @@
+     'climate.main_room',
+     'climate.my_home',
+     'climate.spare_room',
++    'sensor.bathroom_dn_temperature',
++    'sensor.bathroom_up_temperature',
++    'sensor.dead_zone_temperature',
++    'sensor.front_room_temperature',
++    'sensor.kids_room_temperature',
++    'sensor.kitchen_temperature',
++    'sensor.main_bedroom_temperature',
++    'sensor.main_room_temperature',
++    'sensor.spare_room_temperature',
+   ])
+ # ---
+ # name: test_setup_non_default_location[sys_006-location_idx_1]
+@@ -43,6 +54,7 @@
+     'button.reset_my_home_2_dhw',
+     'climate.main_room',
+     'climate.my_home_2',
++    'sensor.main_room_temperature',
+     'water_heater.domestic_hot_water',
+   ])
+ # ---
+diff --git a/tests/components/evohome/snapshots/test_water_heater.ambr b/tests/components/evohome/snapshots/test_water_heater.ambr
+index 3b0a114d4e..5a128aeb98 100644
+--- a/tests/components/evohome/snapshots/test_water_heater.ambr
++++ b/tests/components/evohome/snapshots/test_water_heater.ambr
+@@ -4,7 +4,7 @@
+     'attributes': ReadOnlyDict({
+       <WaterHeaterStateAttribute.AWAY_MODE: 'away_mode'>: 'on',
+       <WaterHeaterStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 23.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Hot water',
+       <WaterHeaterCapabilityAttribute.MAX_TEMP: 'max_temp'>: 60.0,
+       <WaterHeaterCapabilityAttribute.MIN_TEMP: 'min_temp'>: 43.3,
+       <WaterHeaterCapabilityAttribute.OPERATION_LIST: 'operation_list'>: list([
+@@ -47,7 +47,7 @@
+     'attributes': ReadOnlyDict({
+       <WaterHeaterStateAttribute.AWAY_MODE: 'away_mode'>: 'on',
+       <WaterHeaterStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 23.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Hot water',
+       <WaterHeaterCapabilityAttribute.MAX_TEMP: 'max_temp'>: 60.0,
+       <WaterHeaterCapabilityAttribute.MIN_TEMP: 'min_temp'>: 43.3,
+       <WaterHeaterCapabilityAttribute.OPERATION_LIST: 'operation_list'>: list([
+@@ -124,7 +124,7 @@
+     'attributes': ReadOnlyDict({
+       <WaterHeaterStateAttribute.AWAY_MODE: 'away_mode'>: 'on',
+       <WaterHeaterStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 23.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Hot water',
+       <WaterHeaterCapabilityAttribute.MAX_TEMP: 'max_temp'>: 60.0,
+       <WaterHeaterCapabilityAttribute.MIN_TEMP: 'min_temp'>: 43.3,
+       <WaterHeaterCapabilityAttribute.OPERATION_LIST: 'operation_list'>: list([
+@@ -167,7 +167,7 @@
+     'attributes': ReadOnlyDict({
+       <WaterHeaterStateAttribute.AWAY_MODE: 'away_mode'>: 'on',
+       <WaterHeaterStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 23.0,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Hot water',
+       <WaterHeaterCapabilityAttribute.MAX_TEMP: 'max_temp'>: 60.0,
+       <WaterHeaterCapabilityAttribute.MIN_TEMP: 'min_temp'>: 43.3,
+       <WaterHeaterCapabilityAttribute.OPERATION_LIST: 'operation_list'>: list([
+@@ -210,7 +210,7 @@
+     'attributes': ReadOnlyDict({
+       <WaterHeaterStateAttribute.AWAY_MODE: 'away_mode'>: 'off',
+       <WaterHeaterStateAttribute.CURRENT_TEMPERATURE: 'current_temperature'>: 45.5,
+-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water',
++      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Domestic Hot Water Hot water',
+       <WaterHeaterCapabilityAttribute.MAX_TEMP: 'max_temp'>: 60.0,
+       <WaterHeaterCapabilityAttribute.MIN_TEMP: 'min_temp'>: 43.3,
+       <WaterHeaterCapabilityAttribute.OPERATION_LIST: 'operation_list'>: list([
+diff --git a/tests/components/evohome/test_button.py b/tests/components/evohome/test_button.py
+index 25a442c413..8078678261 100644
+--- a/tests/components/evohome/test_button.py
++++ b/tests/components/evohome/test_button.py
+@@ -81,7 +81,10 @@ async def test_system_reset_button_press(
+ ) -> None:
+     """Test SERVICE_PRESS on the system reset button."""
+ 
+-    with patch("evohomeasync2.control_system.ControlSystem.reset") as mock_fcn:
++    with (
++        patch("evohomeasync2.control_system.ControlSystem.reset") as mock_fcn,
++        patch("evohomeasync2.hotwater.HotWater.reset") as mock_dhw,
++    ):
+         await hass.services.async_call(
+             BUTTON_DOMAIN,
+             SERVICE_PRESS,
+@@ -90,6 +93,7 @@ async def test_system_reset_button_press(
+         )
+ 
+         mock_fcn.assert_awaited_once_with()
++        mock_dhw.assert_awaited_once_with()
+ 
+ 
+ @pytest.mark.parametrize("install", ["default"])
+diff --git a/tests/components/evohome/test_climate.py b/tests/components/evohome/test_climate.py
+index 22aa66cda2..e07b442a0e 100644
+--- a/tests/components/evohome/test_climate.py
++++ b/tests/components/evohome/test_climate.py
+@@ -229,7 +229,7 @@ async def test_ctl_authentication_failed(
+             "evohomeasync2.control_system.ControlSystem.set_mode",
+             side_effect=evo_exc.AuthenticationFailedError("Authentication failed"),
+         ),
+-        pytest.raises(evo_exc.AuthenticationFailedError),
++        pytest.raises(HomeAssistantError),
+     ):
+         await hass.services.async_call(
+             CLIMATE_DOMAIN,
+diff --git a/tests/components/evohome/test_config_flow.py b/tests/components/evohome/test_config_flow.py
+new file mode 100644
+index 0000000000..43a39c87d0
+--- /dev/null
++++ b/tests/components/evohome/test_config_flow.py
+@@ -0,0 +1,275 @@
++"""Core-fixture tests for the proposed Evohome config-entry migration."""
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock, patch
++
++from aiohttp import ClientError
++import evohomeasync2 as evo
++import pytest
++from pytest_homeassistant.common import MockConfigEntry
++
++from homeassistant import requirements
++from homeassistant.components.evohome.config_flow import (
++    EvohomeConfigFlow,
++    EvohomeOptionsFlow,
++)
++from homeassistant.config_entries import ConfigFlowResult
++from homeassistant.core import HomeAssistant
++
++CREDENTIALS = {"username": "test@example.invalid", "password": "test-only"}
++
++
++@pytest.fixture
++def flow(hass: HomeAssistant) -> EvohomeConfigFlow:
++    """Provide an unattached flow for isolated error-path tests."""
++    result = EvohomeConfigFlow()
++    result.hass = hass
++    result.context = {"source": "user"}
++    result.flow_id = "test"
++    return result
++
++
++@pytest.fixture
++def systems() -> list[tuple[int, SimpleNamespace, SimpleNamespace]]:
++    """Provide a fake controller with stable identifiers."""
++    controller = SimpleNamespace(id="controller-test")
++    location = SimpleNamespace(
++        id="location-test",
++        name="Test home",
++        gateways=[SimpleNamespace(systems=[controller])],
++    )
++    return [(0, location, controller)]
++
++
++@pytest.fixture
++def entry() -> MockConfigEntry:
++    """Provide the selected controller identity."""
++    return MockConfigEntry(
++        domain="evohome",
++        unique_id="location-test_controller-test",
++        data={
++            **CREDENTIALS,
++            "location_id": "location-test",
++            "system_id": "controller-test",
++        },
++        options={"scan_interval": 300},
++    )
++
++
++async def test_user_flow_manager(
++    hass: HomeAssistant, systems: list[tuple[int, SimpleNamespace, SimpleNamespace]]
++) -> None:
++    """Create a native config entry through Core's flow manager."""
++    await requirements.async_get_integration_with_requirements(hass, "evohome")
++    with (
++        patch.object(
++            EvohomeConfigFlow, "_async_discover", AsyncMock(return_value=systems)
++        ),
++        patch(
++            "homeassistant.components.evohome.async_setup_entry",
++            AsyncMock(return_value=None),
++        ),
++    ):
++        result = await hass.config_entries.flow.async_init(
++            "evohome", context={"source": "user"}
++        )
++        assert result["step_id"] == "user"
++        result = await hass.config_entries.flow.async_configure(
++            result["flow_id"], CREDENTIALS
++        )
++        assert result["step_id"] == "controller"
++        result = await hass.config_entries.flow.async_configure(
++            result["flow_id"], {"system_id": "controller-test"}
++        )
++        await hass.async_block_till_done()
++    assert result["type"] == "create_entry"
++    assert result["result"].unique_id == "location-test_controller-test"
++
++
++@pytest.mark.parametrize(
++    ("error", "reason"),
++    [
++        pytest.param(evo.BadUserCredentialsError("invalid"), "invalid_auth", id="auth"),
++        pytest.param(TimeoutError(), "cannot_connect", id="timeout"),
++        pytest.param(ClientError("offline"), "cannot_connect", id="client"),
++        pytest.param(evo.EvohomeError("offline"), "cannot_connect", id="vendor"),
++    ],
++)
++async def test_user_errors(
++    flow: EvohomeConfigFlow, error: Exception, reason: str
++) -> None:
++    """Keep failures retryable without storing credentials."""
++    with patch.object(flow, "_async_discover", AsyncMock(side_effect=error)):
++        result = await flow.async_step_user(CREDENTIALS)
++    assert result["errors"] == {"base": reason}
++
++
++async def test_no_systems(flow: EvohomeConfigFlow) -> None:
++    """Reject accounts with no supported controller."""
++    with patch.object(flow, "_async_discover", AsyncMock(return_value=[])):
++        assert (await flow.async_step_user(CREDENTIALS))["reason"] == "no_systems"
++
++
++async def test_single_instance(flow: EvohomeConfigFlow, entry: MockConfigEntry) -> None:
++    """Reject duplicate setup before account discovery."""
++    with patch.object(flow, "_async_current_entries", return_value=[entry]):
++        assert (await flow.async_step_user())["reason"] == "single_instance_allowed"
++
++
++async def test_controller_checks(
++    flow: EvohomeConfigFlow,
++    systems: list[tuple[int, SimpleNamespace, SimpleNamespace]],
++    entry: MockConfigEntry,
++) -> None:
++    """Reject an invalid choice and a concurrent second controller."""
++    flow._systems = systems
++    flow._credentials = CREDENTIALS
++    assert (await flow.async_step_controller({"system_id": "missing"}))[
++        "reason"
++    ] == "no_systems"
++    with patch.object(flow, "_async_current_entries", return_value=[entry]):
++        assert (await flow.async_step_controller({"system_id": "controller-test"}))[
++            "reason"
++        ] == "single_instance_allowed"
++
++
++@pytest.mark.parametrize(
++    ("error", "reason"),
++    [
++        pytest.param(evo.BadUserCredentialsError("invalid"), "invalid_auth", id="auth"),
++        pytest.param(TimeoutError(), "cannot_connect", id="timeout"),
++    ],
++)
++async def test_import_errors(
++    flow: EvohomeConfigFlow, error: Exception, reason: str
++) -> None:
++    """Abort invalid YAML imports."""
++    with patch.object(flow, "_async_discover", AsyncMock(side_effect=error)):
++        assert (await flow.async_step_import(CREDENTIALS))["reason"] == reason
++
++
++async def test_import(
++    flow: EvohomeConfigFlow, systems: list[tuple[int, SimpleNamespace, SimpleNamespace]]
++) -> None:
++    """Import stable IDs and clamp legacy polling."""
++    with patch.object(flow, "_async_discover", AsyncMock(return_value=systems)):
++        result = await flow.async_step_import({**CREDENTIALS, "scan_interval": 60})
++    assert result["type"] == "create_entry"
++    assert result["options"] == {"scan_interval": 180}
++
++
++async def test_import_missing_location(
++    flow: EvohomeConfigFlow, systems: list[tuple[int, SimpleNamespace, SimpleNamespace]]
++) -> None:
++    """Do not silently switch legacy location index."""
++    with patch.object(flow, "_async_discover", AsyncMock(return_value=systems)):
++        assert (await flow.async_step_import({**CREDENTIALS, "location_idx": 9}))[
++            "reason"
++        ] == "no_systems"
++
++
++@pytest.mark.parametrize(
++    "entries",
++    [
++        pytest.param([True], id="already-configured"),
++        pytest.param([False, True], id="concurrent"),
++    ],
++)
++async def test_import_single_instance(
++    flow: EvohomeConfigFlow,
++    systems: list[tuple[int, SimpleNamespace, SimpleNamespace]],
++    entries: list[bool],
++    entry: MockConfigEntry,
++) -> None:
++    """Avoid duplicate entries during import races."""
++    with (
++        patch.object(
++            flow,
++            "_async_current_entries",
++            side_effect=[[entry] * int(value) for value in entries],
++        ),
++        patch.object(flow, "_async_discover", AsyncMock(return_value=systems)),
++    ):
++        assert (await flow.async_step_import(CREDENTIALS))[
++            "reason"
++        ] == "single_instance_allowed"
++
++
++@pytest.mark.parametrize(
++    ("error", "reason"),
++    [
++        pytest.param(evo.BadUserCredentialsError("invalid"), "invalid_auth", id="auth"),
++        pytest.param(TimeoutError(), "cannot_connect", id="timeout"),
++    ],
++)
++async def test_reauth_errors(
++    flow: EvohomeConfigFlow, entry: MockConfigEntry, error: Exception, reason: str
++) -> None:
++    """Keep credentials unchanged after failed reauthentication."""
++    with (
++        patch.object(flow, "_get_reauth_entry", return_value=entry),
++        patch.object(flow, "_async_discover", AsyncMock(side_effect=error)),
++    ):
++        assert (await flow.async_step_reauth_confirm(CREDENTIALS))["errors"] == {
++            "base": reason
++        }
++
++
++async def test_reauth_forms_and_identity(
++    flow: EvohomeConfigFlow,
++    entry: MockConfigEntry,
++    systems: list[tuple[int, SimpleNamespace, SimpleNamespace]],
++) -> None:
++    """Require the same controller during reauthentication."""
++    with patch.object(flow, "_get_reauth_entry", return_value=entry):
++        assert (await flow.async_step_reauth({}))["step_id"] == "reauth_confirm"
++        with patch.object(flow, "_async_discover", AsyncMock(return_value=[])):
++            assert (await flow.async_step_reauth_confirm(CREDENTIALS))["errors"] == {
++                "base": "wrong_controller"
++            }
++        with (
++            patch.object(flow, "_async_discover", AsyncMock(return_value=systems)),
++            patch.object(
++                flow, "async_update_reload_and_abort", return_value={"type": "abort"}
++            ) as update,
++        ):
++            await flow.async_step_reauth_confirm(CREDENTIALS)
++        update.assert_called_once_with(entry, data_updates=CREDENTIALS)
++
++
++async def test_discovery_is_read_only(
++    flow: EvohomeConfigFlow, systems: list[tuple[int, SimpleNamespace, SimpleNamespace]]
++) -> None:
++    """Use configuration-only discovery and avoid persistent token writes."""
++    client = MagicMock(locations=[systems[0][1]])
++    client.setup = AsyncMock()
++    with (
++        patch(
++            "homeassistant.components.evohome.config_flow.async_get_clientsession",
++            return_value=MagicMock(),
++        ),
++        patch("homeassistant.components.evohome.config_flow.TokenManager") as manager,
++        patch(
++            "homeassistant.components.evohome.config_flow.evo.EvohomeClient",
++            return_value=client,
++        ),
++    ):
++        assert await flow._async_discover(CREDENTIALS) == systems
++    assert manager.call_args.kwargs["store_key"] is None
++    client.setup.assert_awaited_once_with()
++    assert [call[0] for call in client.method_calls] == ["setup"]
++
++
++async def test_options(hass: HomeAssistant, entry: MockConfigEntry) -> None:
++    """Expose bounded polling and save the selected interval."""
++    flow = EvohomeConfigFlow.async_get_options_flow(entry)
++    assert isinstance(flow, EvohomeOptionsFlow)
++    flow.hass = hass
++    with patch.object(
++        type(flow), "config_entry", new_callable=lambda: property(lambda _: entry)
++    ):
++        result: ConfigFlowResult = await flow.async_step_init()
++    assert result["data_schema"]({"scan_interval": 300}) == {"scan_interval": 300}
++    assert (await flow.async_step_init({"scan_interval": 600}))["data"] == {
++        "scan_interval": 600
++    }
+diff --git a/tests/components/evohome/test_coordinator.py b/tests/components/evohome/test_coordinator.py
+index bd1e90a65a..088c6fc911 100644
+--- a/tests/components/evohome/test_coordinator.py
++++ b/tests/components/evohome/test_coordinator.py
+@@ -13,11 +13,7 @@ from homeassistant.components.climate import (
+     SERVICE_SET_TEMPERATURE,
+ )
+ from homeassistant.components.evohome import EvoData
+-from homeassistant.components.evohome.const import (
+-    DOMAIN,
+-    EVOHOME_DATA,
+-    SCHEDULE_MAX_AGE,
+-)
++from homeassistant.components.evohome.const import SCHEDULE_MAX_AGE
+ from homeassistant.components.water_heater import DOMAIN as WATER_HEATER_DOMAIN
+ from homeassistant.const import (
+     ATTR_ENTITY_ID,
+@@ -30,7 +26,7 @@ from homeassistant.core import HomeAssistant
+ from homeassistant.exceptions import HomeAssistantError
+ from homeassistant.helpers.update_coordinator import UpdateFailed
+ 
+-from .conftest import setup_evohome
++from .conftest import get_evo_data, setup_evohome
+ from .const import TEST_INSTALLS
+ 
+ 
+@@ -42,7 +38,7 @@ async def test_setup_platform(
+ ) -> None:
+     """Test entities and their states after setup of evohome."""
+ 
+-    evo_data: EvoData = hass.data.get(DOMAIN)  # type: ignore[assignment]
++    evo_data: EvoData = get_evo_data(hass)  # type: ignore[assignment]
+     update_interval: timedelta = evo_data.coordinator.update_interval  # type: ignore[assignment]
+ 
+     # confirm initial state after coordinator.async_first_refresh()...
+@@ -93,7 +89,7 @@ async def test_high_precision_temps(
+ ) -> None:
+     """Test a zone uses the v1 API's temperature, if its location has a TCS."""
+ 
+-    evo_data: EvoData = hass.data.get(DOMAIN)  # type: ignore[assignment]
++    evo_data: EvoData = get_evo_data(hass)  # type: ignore[assignment]
+     update_interval: timedelta = evo_data.coordinator.update_interval  # type: ignore[assignment]
+ 
+     evo_data.coordinator.temps = {"3432521": 99.9}  # stale, so must be replaced
+@@ -124,7 +120,7 @@ async def test_schedules_fetched_only_when_stale(
+ ) -> None:
+     """Test schedules are re-fetched only after SCHEDULE_MAX_AGE, not every poll."""
+ 
+-    evo_data: EvoData = hass.data.get(DOMAIN)  # type: ignore[assignment]
++    evo_data: EvoData = get_evo_data(hass)  # type: ignore[assignment]
+     update_interval: timedelta = evo_data.coordinator.update_interval  # type: ignore[assignment]
+ 
+     num_children = len(tcs.zones) + (tcs.hotwater is not None)
+@@ -238,7 +234,7 @@ async def test_failed_schedule_poll_keeps_entities_available(
+ ) -> None:
+     """Test a failed background schedule GET is logged (and retried), not a failure."""
+ 
+-    update_interval = hass.data[EVOHOME_DATA].coordinator.update_interval
++    update_interval = get_evo_data(hass).coordinator.update_interval
+     assert update_interval is not None
+ 
+     with patch.object(
+diff --git a/tests/components/evohome/test_entry_migration.py b/tests/components/evohome/test_entry_migration.py
+new file mode 100644
+index 0000000000..e9e672128a
+--- /dev/null
++++ b/tests/components/evohome/test_entry_migration.py
+@@ -0,0 +1,260 @@
++"""Acceptance of entry-owned runtime, area sensors and token migration."""
++
++import json
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import evohomeasync as evo_v1
++import evohomeasync2 as evo
++import pytest
++
++from homeassistant.components.evohome import async_remove_entry
++from homeassistant.components.evohome.const import DOMAIN, STORAGE_KEY, STORAGE_VER
++from homeassistant.components.evohome.diagnostics import (
++    async_get_config_entry_diagnostics,
++)
++from homeassistant.components.evohome.storage import TokenManager
++from homeassistant.config_entries import ConfigEntryState
++from homeassistant.core import HomeAssistant
++from homeassistant.exceptions import HomeAssistantError
++from homeassistant.helpers import (
++    area_registry as ar,
++    device_registry as dr,
++    entity_registry as er,
++)
++
++from .conftest import get_evo_data, setup_evohome
++from .const import USERNAME
++from .test_storage import TEST_STORAGE_DATA
++
++
++@pytest.mark.parametrize("install", ["default"])
++async def test_import_preserves_custom_id_area_and_sensor_metadata(
++    hass: HomeAssistant,
++    config: dict[str, str],
++    install: str,
++    entity_registry: er.EntityRegistry,
++    area_registry: ar.AreaRegistry,
++    device_registry: dr.DeviceRegistry,
++) -> None:
++    """Adopt a renamed legacy entity and expose measured room temperature."""
++    area = area_registry.async_create("Test study")
++    legacy = entity_registry.async_get_or_create(
++        "climate",
++        DOMAIN,
++        "3432576",
++        suggested_object_id="custom_room_name",
++        original_name="Main Room",
++    )
++    entity_registry.async_update_entity(legacy.entity_id, area_id=area.id)
++    async for _ in setup_evohome(hass, config, install=install):
++        adopted = entity_registry.async_get(legacy.entity_id)
++        assert adopted is not None
++        assert adopted.area_id == area.id
++        assert adopted.has_entity_name
++        assert adopted.original_name == "Heating"
++        assert adopted.config_entry_id is not None
++        sensor_id = entity_registry.async_get_entity_id(
++            "sensor", DOMAIN, "3432576_temperature"
++        )
++        assert sensor_id is not None
++        sensor = hass.states.get(sensor_id)
++        climate = hass.states.get(legacy.entity_id)
++        assert sensor is not None and climate is not None
++        assert sensor.attributes["device_class"] == "temperature"
++        assert sensor.attributes["state_class"] == "measurement"
++        assert sensor.attributes["unit_of_measurement"] == "°C"
++        assert float(sensor.state) == climate.attributes["current_temperature"]
++        assert float(sensor.state) != climate.attributes["temperature"]
++        sensor_entry = entity_registry.async_get(sensor_id)
++        assert sensor_entry is not None and sensor_entry.device_id is not None
++        device = device_registry.async_get(sensor_entry.device_id)
++        assert device is not None and device.area_id == area.id
++        area_registry.async_update(area.id, temperature_entity_id=sensor_id)
++        assert area_registry.async_get_area(area.id).temperature_entity_id == sensor_id
++
++
++@pytest.mark.parametrize("install", ["default"])
++async def test_reload_and_options_keep_all_ids(
++    hass: HomeAssistant,
++    config: dict[str, str],
++    install: str,
++    entity_registry: er.EntityRegistry,
++) -> None:
++    """Reload platforms and apply a polling option without renaming entities."""
++    async for _ in setup_evohome(hass, config, install=install):
++        entry = hass.config_entries.async_entries(DOMAIN)[0]
++        before = {
++            row.unique_id: row.entity_id
++            for row in entity_registry.entities.values()
++            if row.platform == DOMAIN and row.config_entry_id == entry.entry_id
++        }
++        await hass.config_entries.async_reload(entry.entry_id)
++        await hass.async_block_till_done()
++        assert entry.state == ConfigEntryState.LOADED
++        form = await hass.config_entries.options.async_init(entry.entry_id)
++        assert form["step_id"] == "init"
++        result = await hass.config_entries.options.async_configure(
++            form["flow_id"], {"scan_interval": 600}
++        )
++        await hass.async_block_till_done()
++        assert result["type"] == "create_entry"
++        assert entry.options["scan_interval"] == 600
++        assert get_evo_data(hass).coordinator.update_interval.total_seconds() == 600
++        after = {
++            row.unique_id: row.entity_id
++            for row in entity_registry.entities.values()
++            if row.platform == DOMAIN and row.config_entry_id == entry.entry_id
++        }
++        assert before == after
++
++
++@pytest.mark.parametrize("install", ["default"])
++@pytest.mark.usefixtures("evohome")
++async def test_failed_poll_makes_sensor_unavailable_and_recovers(
++    hass: HomeAssistant,
++    entity_registry: er.EntityRegistry,
++) -> None:
++    """Never retain a stale room reading as available after a failed poll."""
++    coordinator = get_evo_data(hass).coordinator
++    entity_id = entity_registry.async_get_entity_id(
++        "sensor", DOMAIN, "3432576_temperature"
++    )
++    assert entity_id is not None
++    with patch.object(
++        coordinator.loc, "get_status", side_effect=evo.EvohomeError("offline")
++    ):
++        await coordinator.async_refresh()
++        await hass.async_block_till_done()
++        assert hass.states.get(entity_id).state == "unavailable"
++    await coordinator.async_refresh()
++    await hass.async_block_till_done()
++    assert hass.states.get(entity_id).state not in ("unavailable", "unknown")
++
++
++@pytest.mark.parametrize("install", ["default"])
++@pytest.mark.usefixtures("evohome")
++async def test_bad_precision_credentials_drop_stale_cache(hass: HomeAssistant) -> None:
++    """Disable rejected precision credentials and clear their previous readings."""
++    coordinator = get_evo_data(hass).coordinator
++    client = MagicMock(spec=evo_v1.EvohomeClient)
++    client.get_status = AsyncMock(side_effect=evo_v1.BadUserCredentialsError("invalid"))
++    coordinator.client_v1 = client
++    coordinator.temps = {"3432576": 99.9}
++    await coordinator._update_v1_api_temps()
++    assert coordinator.temps == {}
++    assert coordinator.client_v1 is None
++
++
++@pytest.mark.parametrize("install", ["default"])
++@pytest.mark.usefixtures("evohome")
++async def test_diagnostics_exclude_account_and_controller_data(
++    hass: HomeAssistant,
++) -> None:
++    """Expose counters without credentials, room names or controller identifiers."""
++    entry = hass.config_entries.async_entries(DOMAIN)[0]
++    diagnostic = await async_get_config_entry_diagnostics(hass, entry)
++    serialized = json.dumps(diagnostic)
++    assert entry.data["username"] not in serialized
++    assert entry.data["password"] not in serialized
++    assert entry.data["location_id"] not in serialized
++    assert entry.data["system_id"] not in serialized
++    assert entry.entry_id not in serialized
++    assert "raw" not in diagnostic
++    assert diagnostic["zone_count"] > 0
++
++
++@pytest.mark.parametrize("install", ["minimal"])
++async def test_remove_only_entry_token_store(
++    hass: HomeAssistant,
++    config: dict[str, str],
++    install: str,
++    hass_storage: dict[str, object],
++) -> None:
++    """Do not remove unrelated entry or rollback token caches."""
++    hass_storage[STORAGE_KEY] = {
++        "version": STORAGE_VER,
++        "data": TEST_STORAGE_DATA["with_session_id"],
++    }
++    async for _ in setup_evohome(hass, config, install=install):
++        entry = hass.config_entries.async_entries(DOMAIN)[0]
++        other_key = f"{STORAGE_KEY}.other-entry"
++        hass_storage[other_key] = {
++            "version": STORAGE_VER,
++            "data": {"test": "unrelated"},
++        }
++        await async_remove_entry(hass, entry)
++        assert f"{STORAGE_KEY}.{entry.entry_id}" not in hass_storage
++        assert STORAGE_KEY in hass_storage
++        assert other_key in hass_storage
++
++
++async def test_ephemeral_validation_does_not_load_legacy_tokens(
++    hass: HomeAssistant,
++) -> None:
++    """Credential validation must not succeed by reusing an old account token."""
++    manager = TokenManager(hass, USERNAME, "invalid", MagicMock(), store_key=None)
++    await manager._load_cache_from_store()
++    assert manager._store is None
++    assert manager._legacy_store is None
++    assert manager._access_token == ""
++
++
++async def test_wrong_account_legacy_tokens_are_not_copied(
++    hass: HomeAssistant,
++    hass_storage: dict[str, object],
++) -> None:
++    """Keep tokens from a different username outside the new entry."""
++    hass_storage[STORAGE_KEY] = {
++        "version": STORAGE_VER,
++        "data": TEST_STORAGE_DATA["with_session_id"],
++    }
++    manager = TokenManager(
++        hass,
++        "different@example.invalid",
++        "test",
++        MagicMock(),
++        store_key="evohome.new-entry",
++        legacy_store_key=STORAGE_KEY,
++    )
++    await manager._load_cache_from_store()
++    assert manager._access_token == ""
++    assert "evohome.new-entry" not in hass_storage
++
++
++@pytest.mark.parametrize("install", ["default"])
++@pytest.mark.usefixtures("evohome")
++async def test_bad_command_credentials_start_reauth(hass: HomeAssistant) -> None:
++    """Command rejection is visible and starts the existing entry's reauth flow."""
++    coordinator = get_evo_data(hass).coordinator
++    entry = hass.config_entries.async_entries(DOMAIN)[0]
++    call = AsyncMock(side_effect=evo.BadUserCredentialsError("invalid"))
++    with patch.object(entry, "async_start_reauth") as reauth:
++        with pytest.raises(HomeAssistantError):
++            await coordinator.call_client_api(call())
++        reauth.assert_called_once_with(hass)
++
++
++@pytest.mark.parametrize("install", ["default"])
++async def test_import_preserves_hot_water_area(
++    hass: HomeAssistant,
++    config: dict[str, str],
++    install: str,
++    entity_registry: er.EntityRegistry,
++    area_registry: ar.AreaRegistry,
++    device_registry: dr.DeviceRegistry,
++) -> None:
++    """Reuse the water heater's legacy area when creating its device."""
++    area = area_registry.async_create("Test utility")
++    legacy = entity_registry.async_get_or_create(
++        "water_heater",
++        DOMAIN,
++        "3933910",
++        suggested_object_id="custom_hot_water",
++    )
++    entity_registry.async_update_entity(legacy.entity_id, area_id=area.id)
++    async for _ in setup_evohome(hass, config, install=install):
++        adopted = entity_registry.async_get(legacy.entity_id)
++        assert adopted is not None and adopted.device_id is not None
++        assert adopted.area_id == area.id
++        device = device_registry.async_get(adopted.device_id)
++        assert device is not None and device.area_id == area.id
+diff --git a/tests/components/evohome/test_init.py b/tests/components/evohome/test_init.py
+index 4421f98867..b18d9ad407 100644
+--- a/tests/components/evohome/test_init.py
++++ b/tests/components/evohome/test_init.py
+@@ -139,10 +139,18 @@ async def test_authentication_failure_v2(
+         caplog.at_level(logging.WARNING),
+     ):
+         result = await async_setup_component(hass, DOMAIN, {DOMAIN: config})
++        await hass.async_block_till_done()
+ 
+-    assert result is False
++    assert result is True
++    assert not hass.config_entries.async_entries(DOMAIN)
+ 
+-    assert caplog.record_tuples == AUTHENTICATION_TESTS[exception]
++    issue = ir.async_get(hass).async_get_issue(DOMAIN, "yaml_import_failed")
++    assert issue is not None
++    assert issue.translation_placeholders == {
++        "reason": (
++            "invalid_auth" if exception is EXC_BAD_CREDENTIALS else "cannot_connect"
++        )
++    }
+ 
+ 
+ @pytest.mark.parametrize("exception", CLIENT_REQUEST_TESTS)
+@@ -166,10 +174,14 @@ async def test_client_request_failure_v2(
+         caplog.at_level(logging.WARNING),
+     ):
+         result = await async_setup_component(hass, DOMAIN, {DOMAIN: config})
++        await hass.async_block_till_done()
+ 
+-    assert result is False
++    assert result is True
++    assert not hass.config_entries.async_entries(DOMAIN)
+ 
+-    assert caplog.record_tuples == CLIENT_REQUEST_TESTS[exception]
++    issue = ir.async_get(hass).async_get_issue(DOMAIN, "yaml_import_failed")
++    assert issue is not None
++    assert issue.translation_placeholders == {"reason": "cannot_connect"}
+ 
+ 
+ @pytest.mark.parametrize("install", ["default"])
+diff --git a/tests/components/evohome/test_storage.py b/tests/components/evohome/test_storage.py
+index 83563014b4..3263990f09 100644
+--- a/tests/components/evohome/test_storage.py
++++ b/tests/components/evohome/test_storage.py
+@@ -78,7 +78,8 @@ async def test_auth_tokens_null(
+     async for _ in setup_evohome(hass, config, install=install):
+         pass
+ 
+-    data: _TokenStoreT = hass_storage[DOMAIN]["data"]
++    entry = hass.config_entries.async_entries(DOMAIN)[0]
++    data: _TokenStoreT = hass_storage[f"{STORAGE_KEY}.{entry.entry_id}"]["data"]
+ 
+     # Confirm the expected tokens were cached to storage...
+     assert data[CONF_USERNAME] == USERNAME
+@@ -105,7 +106,8 @@ async def test_auth_tokens_same(
+     async for _ in setup_evohome(hass, config, install=install):
+         pass
+ 
+-    data: _TokenStoreT = hass_storage[DOMAIN]["data"]
++    entry = hass.config_entries.async_entries(DOMAIN)[0]
++    data: _TokenStoreT = hass_storage[f"{STORAGE_KEY}.{entry.entry_id}"]["data"]
+ 
+     # Confirm the expected tokens were cached to storage...
+     assert data[CONF_USERNAME] == USERNAME
+@@ -138,7 +140,8 @@ async def test_auth_tokens_past(
+     async for _ in setup_evohome(hass, config, install=install):
+         pass
+ 
+-    data: _TokenStoreT = hass_storage[DOMAIN]["data"]
++    entry = hass.config_entries.async_entries(DOMAIN)[0]
++    data: _TokenStoreT = hass_storage[f"{STORAGE_KEY}.{entry.entry_id}"]["data"]
+ 
+     # Confirm the expected tokens were cached to storage...
+     assert data[CONF_USERNAME] == USERNAME
+@@ -167,7 +170,8 @@ async def test_auth_tokens_diff(
+     async for _ in setup_evohome(hass, config, install=install):
+         pass
+ 
+-    data: _TokenStoreT = hass_storage[DOMAIN]["data"]
++    entry = hass.config_entries.async_entries(DOMAIN)[0]
++    data: _TokenStoreT = hass_storage[f"{STORAGE_KEY}.{entry.entry_id}"]["data"]
+ 
+     # Confirm the expected tokens were cached to storage...
+     assert data[CONF_USERNAME] == f"new_{USERNAME}"
+diff --git a/tests/components/evohome/test_system_reset_dhw.py b/tests/components/evohome/test_system_reset_dhw.py
+new file mode 100644
+index 0000000000..29c30fac1b
+--- /dev/null
++++ b/tests/components/evohome/test_system_reset_dhw.py
+@@ -0,0 +1,63 @@
++"""Regression coverage for controller reset leaving DHW overridden."""
++
++from collections.abc import Awaitable
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import evohomeasync2 as evo
++import pytest
++
++from homeassistant.components.evohome.button import EvoSystemResetButton
++from homeassistant.components.evohome.coordinator import EvoDataUpdateCoordinator
++from homeassistant.core import HomeAssistant
++
++
++@pytest.mark.parametrize("has_hot_water", [True, False])
++async def test_system_reset_clears_hot_water(
++    hass: HomeAssistant, has_hot_water: bool
++) -> None:
++    """Clear DHW separately because controller AutoWithReset does not do so."""
++    coordinator = MagicMock(spec=EvoDataUpdateCoordinator)
++    coordinator.hass = hass
++
++    async def call_api(
++        coro: Awaitable[object], *, request_refresh: bool = True
++    ) -> object:
++        return await coro
++
++    coordinator.call_client_api = AsyncMock(side_effect=call_api)
++    coordinator.async_request_refresh = AsyncMock()
++    controller = MagicMock(spec=evo.ControlSystem)
++    controller.id = "test-controller"
++    controller.location = SimpleNamespace(name="Test home")
++    controller.reset = AsyncMock()
++    hot_water = MagicMock(spec=evo.HotWater)
++    hot_water.reset = AsyncMock()
++    controller.hotwater = hot_water if has_hot_water else None
++    await EvoSystemResetButton(coordinator, controller).async_press()
++    controller.reset.assert_awaited_once()
++    assert hot_water.reset.await_count == int(has_hot_water)
++    coordinator.async_request_refresh.assert_awaited_once()
++
++
++async def test_failed_reset_still_refreshes(hass: HomeAssistant) -> None:
++    """Report a failing reset and refresh the state after partial completion."""
++    coordinator = MagicMock(spec=EvoDataUpdateCoordinator)
++    coordinator.hass = hass
++
++    async def call_api(
++        coro: Awaitable[object], *, request_refresh: bool = True
++    ) -> object:
++        return await coro
++
++    coordinator.call_client_api = AsyncMock(side_effect=call_api)
++    coordinator.async_request_refresh = AsyncMock()
++    controller = MagicMock(spec=evo.ControlSystem)
++    controller.id = "test-controller"
++    controller.location = SimpleNamespace(name="Test home")
++    controller.reset = AsyncMock()
++    controller.hotwater = MagicMock(spec=evo.HotWater)
++    controller.hotwater.reset = AsyncMock(side_effect=RuntimeError("reset failed"))
++    with pytest.raises(RuntimeError, match="reset failed"):
++        await EvoSystemResetButton(coordinator, controller).async_press()
++    coordinator.async_request_refresh.assert_awaited_once()

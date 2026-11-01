@@ -1,0 +1,2 @@
+# Preserve portable contribution patches on Windows checkouts.
+*.patch text eol=lf

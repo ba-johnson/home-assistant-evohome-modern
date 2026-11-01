@@ -22,9 +22,14 @@ Completed validation:
   `d6e25b0c2cb2eea0eb7b7f61691801fbf4a70a99` passed the full Evohome suite:
   169 tests, 163 snapshots, mypy for 10 modules and Ruff. Python 3.14.10 and
   Core's pinned `evohome-async==3.1.0` were used. See `contrib/README.md`.
-- The separate migration prototype has 19 passing Core-fixture flow tests and
-  100% config-flow coverage, using vendor 2.1.0. That does not establish full
-  migration compatibility with current Core's vendor 3.1.0.
+- The full migration is now rebased onto the same current Core commit and
+  vendor 3.1.0, retaining its hourly schedule cache. The complete Evohome suite
+  passes: **198 tests and 163 snapshots**, mypy for 14 source modules, Ruff and
+  current Core Hassfest. Config-flow line and branch coverage is 100% (19 tests).
+  Migration tests cover existing IDs/areas, hot-water areas, reload/options,
+  measured temperature metadata, failed-poll recovery and token isolation.
+  See `contrib/core-modernization-v3.patch`; this is a review patch, not a
+  replacement for the published alpha or a claim of current-Core live testing.
 
 Open acceptance work:
 
@@ -34,13 +39,10 @@ Open acceptance work:
 - Standalone zone reset was reproduced: mode cleared but effective target did
   not restore. Cleanup restored the recorded target and FollowSchedule. The
   behaviour must be understood/fixed before a stable full-bundle release.
-- Rebase the full migration onto current Core's vendor 3.1.0 APIs and preserve
-  its hourly schedule-cache behaviour. The older-baseline bundle cannot simply
-  replace current upstream files. Then migrate and run the entire existing
-  Core suite, beyond the passing prototype flow tests.
 - Complete graphical HACS acceptance if claiming a fully tested UI setup path.
-- Run all Core pre-commit hooks in a Git checkout and complete human review
-  before upstream submission; the source-archive test tree cannot run Git hooks.
+- Complete all Core pre-commit hooks and human review before upstream submission.
+  Repository-wide hooks are being checked in a real Git checkout; successful
+  component tests do not establish repository-wide CI acceptance.
 
 Proposed contribution order (not submitted):
 

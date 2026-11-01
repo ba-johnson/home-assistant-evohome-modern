@@ -32,8 +32,30 @@ uv run --no-sync mypy --follow-imports=silent homeassistant/components/evohome
 
 Generate English translations using Core's documented development setup before
 tests. The patch retains upstream licence/ownership and needs human review; it
-has not been submitted upstream. The full migration still needs a separate
-rebase onto current Core APIs and schedule caching.
+has not been submitted upstream.
+
+## Full migration review patch
+
+`core-modernization-v3.patch` is an alternative, larger patch against the same
+Core commit. It includes the DHW reset fix: apply one patch, not both.
+
+The migration adds UI setup, YAML import and repairs, reauthentication, options,
+entry-owned runtime/token storage, measured room-temperature sensors and device
+metadata while preserving existing entity IDs and areas. It retains current
+Core's vendor 3.1.0 APIs and hourly schedule caching. Upstream ownership and
+requirements are preserved; HACS packaging is excluded.
+
+Verified with Python 3.14.10 and vendor 3.1.0:
+
+- Complete Evohome suite: **198 tests and 163 snapshots passed**.
+- Config flow: **100% line and branch coverage**, 19 tests.
+- Mypy: **14 source modules passed**; Ruff and current Core Hassfest passed.
+- Patch reverse application checked against the tested tree.
+
+This remains a review candidate. Repository-wide hooks and human review are
+separate gates; overnight pilot observation and standalone zone-reset target
+behaviour remain open. The current-Core migration has not been deployed to the
+older live pilot. Do not install this patch as a custom-component update.
 
 The upstream [AI policy](https://github.com/home-assistant/core/blob/d6e25b0c2cb2eea0eb7b7f61691801fbf4a70a99/AI_POLICY.md)
 requires contributors to review and understand their changes before submission.

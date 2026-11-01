@@ -57,3 +57,9 @@ restart. See NAMING-REPAIR-TASK.md for the original repair history.
 
 Private paths, backup IDs, rollback commands and observations are recorded
 outside this distributable repository in the infrastructure investigation files.
+
+Current-Core migration follow-up (1 November): rebased onto vendor 3.1.0 and
+the upstream hourly schedule cache; 198 tests/163 snapshots, 100% config-flow
+line/branch coverage, mypy (14 modules), Ruff and Hassfest pass. A separate
+portable review patch is under `contrib/`. This does not change the live pilot
+or close its standalone zone-reset/overnight acceptance work.
