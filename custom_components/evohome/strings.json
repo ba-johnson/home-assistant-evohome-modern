@@ -1,0 +1,202 @@
+{
+  "exceptions": {
+    "controller_only_service": {
+      "message": "Only Evohome controllers support the `{service}` action"
+    },
+    "entity_not_found": {
+      "message": "The specified entity `{entity_id}` could not be found"
+    },
+    "invalid_system_mode": {
+      "message": "The requested system mode is not supported: {error}"
+    },
+    "mode_cant_be_temporary": {
+      "message": "The mode `{mode}` does not support 'Duration' or 'Period'"
+    },
+    "mode_cant_have_duration": {
+      "message": "The mode `{mode}` does not support 'Duration'; use 'Period' instead"
+    },
+    "mode_cant_have_period": {
+      "message": "The mode `{mode}` does not support 'Period'; use 'Duration' instead"
+    },
+    "mode_not_supported": {
+      "message": "The mode `{mode}` is not supported by this controller"
+    },
+    "zone_only_service": {
+      "message": "Only zones support the `{service}` action"
+    }
+  },
+  "issues": {
+    "deprecated_clear_zone_override_service": {
+      "description": "The `clear_zone_override` action is deprecated and will stop working in Home Assistant {breaks_in_ha_version}. Use the zone's Reset button instead.",
+      "title": "Evohome 'Clear zone override' action is deprecated"
+    },
+    "deprecated_controller_service": {
+      "description": "The `{service}` action without `entity_id` is deprecated and will stop working in Home Assistant {breaks_in_ha_version}. Update any automation or script to include `entity_id`, targeting the controller's climate entity.",
+      "title": "Untargeted Evohome controller action is deprecated"
+    },
+    "deprecated_preset_reset": {
+      "description": "Using the `Reset` preset on an Evohome controller is deprecated and will stop working in Home Assistant {breaks_in_ha_version}. Use the system's Reset button instead.",
+      "title": "Evohome Reset preset is deprecated"
+    },
+    "deprecated_refresh_system_service": {
+      "description": "The `refresh_system` action is deprecated and will stop working in Home Assistant {breaks_in_ha_version}. Instead, use the `homeassistant.update_entity` action, targeting the controller's climate entity.",
+      "title": "Evohome 'Refresh system' action is deprecated"
+    },
+    "deprecated_reset_system_service": {
+      "description": "The `reset_system` action is deprecated and will stop working in Home Assistant {breaks_in_ha_version}. Use the system's Reset button instead.",
+      "title": "Evohome 'Reset system' action is deprecated"
+    },
+    "yaml_imported": {
+      "title": "Remove legacy Evohome YAML after verification",
+      "description": "Evohome has been imported or is already configured in Devices & services. Verify the controller and zones before removing the evohome section from configuration.yaml. Do not remove the integration entry. Keep a backup for rollback."
+    }
+  },
+  "services": {
+    "clear_zone_override": {
+      "description": "Sets a zone to follow its schedule (deprecated).",
+      "name": "Clear zone override"
+    },
+    "refresh_system": {
+      "description": "Pulls the latest data from the vendor's servers now, rather than waiting for the next scheduled update (deprecated).",
+      "name": "Refresh system"
+    },
+    "reset_system": {
+      "description": "Sets a system's mode to `Auto` mode and resets all its zones to follow their schedules (deprecated). Some older systems may not support this feature.",
+      "name": "Reset system"
+    },
+    "set_dhw_override": {
+      "description": "Overrides a DHW's state, either indefinitely or for a specified duration, after which it will revert to following its schedule.",
+      "fields": {
+        "duration": {
+          "description": "The DHW will revert to its schedule after this time. If 0 the change is until the next scheduled setpoint.",
+          "name": "Duration"
+        },
+        "state": {
+          "description": "The DHW state: True (on: heat the water up to the setpoint) or False (off).",
+          "name": "State"
+        }
+      },
+      "name": "Set DHW override"
+    },
+    "set_system_mode": {
+      "description": "Sets a system's mode, either indefinitely or until a specified end time, after which it will revert to `Auto`. Not all systems support all modes.",
+      "fields": {
+        "duration": {
+          "description": "The duration in hours; used only with `AutoWithEco` mode (up to 24 hours).",
+          "name": "Duration"
+        },
+        "entity_id": {
+          "description": "The Evohome controller climate entity.",
+          "name": "Entity"
+        },
+        "mode": {
+          "description": "Mode to set the system to.",
+          "name": "[%key:common::config_flow::data::mode%]"
+        },
+        "period": {
+          "description": "A period of time in days; used only with `Away`, `DayOff`, or `Custom` mode. The system will revert to `Auto` mode at midnight (up to 99 days, today is day 1).",
+          "name": "Period"
+        }
+      },
+      "name": "Set system mode"
+    },
+    "set_zone_override": {
+      "description": "Overrides a zone's setpoint, either indefinitely or for a specified duration, after which it will revert to following its schedule.",
+      "fields": {
+        "duration": {
+          "description": "The zone will revert to its schedule after this time. If 0 the change is until the next scheduled setpoint.",
+          "name": "Duration"
+        },
+        "setpoint": {
+          "description": "The temperature to be used instead of the scheduled setpoint.",
+          "name": "Setpoint"
+        }
+      },
+      "name": "Set zone override"
+    }
+  },
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Honeywell Total Connect Comfort (Europe)",
+        "description": "Use your international TCC account. Setup only reads configuration; it does not change heating.",
+        "data": {
+          "username": "Email address",
+          "password": "Password"
+        },
+        "data_description": {
+          "username": "The email address used for the international TCC service.",
+          "password": "Your TCC account password, stored locally in Home Assistant."
+        }
+      },
+      "controller": {
+        "title": "Choose your heating controller",
+        "data": {
+          "system_id": "Controller"
+        },
+        "data_description": {
+          "system_id": "The controller this integration will manage."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect your TCC account",
+        "description": "Re-enter credentials for the same controller.",
+        "data": {
+          "username": "Email address",
+          "password": "Password"
+        },
+        "data_description": {
+          "username": "The email address with access to your existing controller.",
+          "password": "The current password for that account."
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "The account credentials were rejected.",
+      "cannot_connect": "Unable to connect to Honeywell. Try again later.",
+      "wrong_controller": "This account cannot access the configured controller."
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Evohome controller can be configured in this alpha.",
+      "already_configured": "This controller is already configured.",
+      "no_systems": "No compatible controller was found for the selected location.",
+      "invalid_auth": "YAML import failed: credentials were rejected. Configure the integration from the UI.",
+      "cannot_connect": "YAML import could not connect. Retry after the service recovers, or configure from the UI.",
+      "reauth_successful": "Your credentials have been updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Cloud polling",
+        "description": "Default: 300 seconds. Short polling can trigger Honeywell rate limits.",
+        "data": {
+          "scan_interval": "Polling interval (seconds)"
+        },
+        "data_description": {
+          "scan_interval": "How often to poll Honeywell, from 180 to 3600 seconds."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "temperature": {
+        "name": "Temperature"
+      }
+    },
+    "climate": {
+      "zone": {
+        "name": "Heating"
+      },
+      "controller": {
+        "name": "Heating controller"
+      }
+    },
+    "water_heater": {
+      "hot_water": {
+        "name": "Hot water"
+      }
+    }
+  }
+}

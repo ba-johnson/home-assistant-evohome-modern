@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.storage/
+.pytest_cache/
+.ruff_cache/
+codex-backups/
+private/
+*.tar
+*.env
+secrets.yaml
+evidence/

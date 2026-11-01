@@ -1,0 +1,21 @@
+{
+  "domain": "evohome",
+  "name": "Evohome Modern (experimental)",
+  "codeowners": [
+    "@ba-johnson"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/ba-johnson/home-assistant-evohome-modern",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/ba-johnson/home-assistant-evohome-modern/issues",
+  "loggers": [
+    "evohomeasync",
+    "evohomeasync2"
+  ],
+  "requirements": [
+    "evohome-async>=2.1.0"
+  ],
+  "single_config_entry": true,
+  "version": "0.1.0a1"
+}

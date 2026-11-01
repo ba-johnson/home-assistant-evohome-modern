@@ -1,0 +1,48 @@
+name: Validate Evohome alpha
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test against Home Assistant 2026.10.4 without network access
+        run: >-
+          docker run --rm --network none
+          -v "$GITHUB_WORKSPACE:/work:ro" -w /work --entrypoint python
+          ghcr.io/home-assistant/home-assistant:2026.10.4@sha256:23f4dfbb69ce76315dbc4de7915504f1c2dcecd7ca2648113a493a385972e133
+          -m unittest discover -s tests -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Lint source and tests
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/work:ro" -w /work --entrypoint sh
+          ghcr.io/home-assistant/home-assistant:2026.10.4@sha256:23f4dfbb69ce76315dbc4de7915504f1c2dcecd7ca2648113a493a385972e133
+          -c 'uv pip install --system --quiet ruff==0.14.3 && ruff check --no-cache custom_components/evohome tests'
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate integration package with official Hassfest
+        run: >-
+          docker run --rm --network none
+          -v "$GITHUB_WORKSPACE:/github/workspace:ro"
+          ghcr.io/home-assistant/hassfest:2026.10.4@sha256:e5828f7e305518506d8b4e8346411357d68358531b761bd118fe6a1631feff44
