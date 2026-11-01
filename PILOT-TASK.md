@@ -20,11 +20,15 @@ Completed:
 - Removed only the legacy Evohome YAML block and passed the HA config check.
 - Restarted again and verified successful config-entry-only startup, preserved
   entities and room-temperature assignments.
-- 27 offline tests, lint and Hassfest passed after the naming-repair fix.
+- 35 offline tests and lint passed; config-flow line/branch coverage is 100%.
+- Actual phone dashboard reset-all cleared a permanent 5-degree override;
+  the vendor app and subsequent HA refresh confirmed the previous target and
+  FollowSchedule. No test override remains in that zone.
 
 Still pending: natural schedule-transition acceptance. A bounded 26-hour,
 read-only observer is recording transitions; no heating commands are sent.
-Browser rendering/tap acceptance was not verified. The initial public release
+The reset card's phone tap path was verified by the pilot user. General browser
+rendering acceptance remains limited. The initial public release
 is an experimental prerelease. No catalogue submission or maintainer message
 has been created.
 

@@ -55,6 +55,101 @@ class ModernTests(unittest.IsolatedAsyncioTestCase):
         f.flow_id = "offline-flow"
         return f
 
+    async def test_discovery_only_fetches_configuration_and_does_not_cache_tokens(self):
+        f = self.flow()
+        client = MagicMock(locations=[self.loc])
+        client.update = AsyncMock()
+        with patch("custom_components.evohome.config_flow.async_get_clientsession", return_value=MagicMock()), \
+             patch("custom_components.evohome.config_flow.TokenManager") as manager, \
+             patch("custom_components.evohome.config_flow.evo.EvohomeClient", return_value=client):
+            rows = await f._async_discover(self.credentials)
+        self.assertEqual(rows, self.rows)
+        self.assertIsNone(manager.call_args.kwargs["store_key"])
+        client.update.assert_awaited_once_with(dont_update_status=True)
+        self.assertEqual([c[0] for c in client.mock_calls], ["update"])
+
+    async def test_user_initial_form_and_vendor_failures(self):
+        from aiohttp import ClientError
+        self.assertEqual((await self.flow().async_step_user())["step_id"], "user")
+        for error in (evo.EvohomeError("offline"), ClientError("offline")):
+            with self.subTest(error=type(error).__name__):
+                f = self.flow()
+                with patch.object(f, "_async_discover", AsyncMock(side_effect=error)):
+                    result = await f.async_step_user(self.credentials)
+                self.assertEqual(result["errors"], {"base": "cannot_connect"})
+
+    async def test_unknown_controller_and_concurrent_setup_are_rejected(self):
+        f = self.flow()
+        f._systems, f._credentials = self.rows, self.credentials
+        self.assertEqual((await f.async_step_controller({"system_id": "missing"}))["reason"], "no_systems")
+        with patch.object(f, "_async_current_entries", return_value=[self.entry()]):
+            result = await f.async_step_controller({"system_id": self.system.id})
+        self.assertEqual(result["reason"], "single_instance_allowed")
+
+    async def test_import_errors_and_existing_entry(self):
+        for error, reason in ((evo.BadUserCredentialsError("invalid"), "invalid_auth"),
+                              (TimeoutError(), "cannot_connect")):
+            f = self.flow()
+            with patch.object(f, "_async_discover", AsyncMock(side_effect=error)):
+                result = await f.async_step_import(self.credentials)
+            self.assertEqual(result["reason"], reason)
+        f = self.flow()
+        with patch.object(f, "_async_current_entries", return_value=[self.entry()]), \
+             patch.object(f, "_yaml_issue") as issue, \
+             patch.object(f, "_async_discover", AsyncMock()) as discover:
+            result = await f.async_step_import(self.credentials)
+        self.assertEqual(result["reason"], "single_instance_allowed")
+        issue.assert_called_once()
+        discover.assert_not_awaited()
+
+    async def test_concurrent_import_does_not_create_second_entry(self):
+        f = self.flow()
+        with patch.object(f, "_async_current_entries", side_effect=[[], [self.entry()]]), \
+             patch.object(f, "_async_discover", AsyncMock(return_value=self.rows)):
+            result = await f.async_step_import(self.credentials)
+        self.assertEqual(result["reason"], "single_instance_allowed")
+
+    async def test_reauth_initial_form_and_failures(self):
+        f = self.flow()
+        with patch.object(f, "_get_reauth_entry", return_value=self.entry()):
+            self.assertEqual((await f.async_step_reauth({}))["step_id"], "reauth_confirm")
+            for error, reason in ((evo.BadUserCredentialsError("invalid"), "invalid_auth"),
+                                  (TimeoutError(), "cannot_connect")):
+                with patch.object(f, "_async_discover", AsyncMock(side_effect=error)):
+                    result = await f.async_step_reauth_confirm(self.credentials)
+                self.assertEqual(result["errors"], {"base": reason})
+
+    async def test_options_saved_and_listener_reloads_only_own_entry(self):
+        from custom_components.evohome import _async_options_updated
+        f = EvohomeConfigFlow.async_get_options_flow(self.entry())
+        self.assertIsInstance(f, EvohomeOptionsFlow)
+        f.hass = self.hass
+        result = await f.async_step_init({"scan_interval": 600})
+        self.assertEqual(result["data"], {"scan_interval": 600})
+        entry = self.entry()
+        with patch.object(self.hass.config_entries, "async_reload", AsyncMock()) as reload:
+            await _async_options_updated(self.hass, entry)
+        reload.assert_awaited_once_with(entry.entry_id)
+
+    async def test_polling_reads_status_and_schedules_without_control_calls(self):
+        zone = MagicMock()
+        zone.get_schedule = AsyncMock()
+        dhw = MagicMock()
+        dhw.get_schedule = AsyncMock()
+        self.system.zones, self.system.hotwater = [zone], dhw
+        self.loc.status = {"test": "status"}
+        self.loc.update = AsyncMock(return_value=self.loc.status)
+        coord = self.coordinator(SimpleNamespace(update=AsyncMock(), locations=[self.loc]))
+        await coord._async_setup()
+        self.assertEqual(await coord._async_update_data(), self.loc.status)
+        zone.get_schedule.assert_not_awaited()
+        self.assertEqual(await coord._async_update_data(), self.loc.status)
+        self.loc.update.assert_awaited()
+        zone.get_schedule.assert_awaited_once_with()
+        dhw.get_schedule.assert_awaited_once_with()
+        self.assertEqual([c[0] for c in zone.mock_calls], ["get_schedule"])
+        self.assertEqual([c[0] for c in dhw.method_calls], ["get_schedule"])
+
     async def test_user_flow_and_stable_ids(self):
         f = self.flow()
         with patch.object(f, "_async_discover", AsyncMock(return_value=self.rows)):

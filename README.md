@@ -85,8 +85,11 @@ docker run --rm --network none \
 
 Validated on 31 October–1 November 2026 against HA 2026.10.4 / Python 3.14.9:
 
-- **27 offline tests passed**, including the real HA flow manager, legacy entity
+- **35 offline tests passed**, including the real HA flow manager, legacy entity
   ID adoption, temperature sensor metadata and fallback/unavailability handling.
+- Config-flow module line and branch coverage is **100%**. CI enforces that
+  threshold. Discovery and polling tests also reject heating-control calls.
+  These are downstream runtime tests, not yet ported to Core's pytest fixtures.
 - Ruff 0.14.3 checks passed for the component and tests.
 - Official Hassfest 2026.10.4 passed with no invalid integrations. Its warning
   about sharing the built-in `evohome` domain is expected and material: this
@@ -104,9 +107,13 @@ reload, actual rollback to the built-in integration, and reactivation. Legacy
 YAML was then removed and config-entry-only startup was verified after restart.
 See [pilot status](PILOT-TASK.md).
 
-Natural schedule-transition observation is still running. UI rendering/tap
-acceptance, type checks, HACS validation, and complete Core-style config-flow
-coverage remain gates for a stable release. This is not a quality-tier or universal
+Natural schedule-transition observation is still running. The pilot's large
+dashboard reset button was exercised on a phone: a permanent 5-degree override
+cleared, the vendor app returned to its prior target, and HA subsequently
+confirmed FollowSchedule at that target. HA's immediate state can lag the app
+until a later refresh. This does not establish standalone zone-reset behaviour.
+Type checks, HACS installation validation and porting tests to Core's pytest
+fixtures remain outstanding. This is not a quality-tier or universal
 compatibility claim, and the unexplained original 5-degree setpoints have not
 been proven to have a single root cause.
 

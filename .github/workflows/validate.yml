@@ -28,12 +28,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Lint source and tests
+      - name: Lint and enforce complete config-flow coverage
         run: >-
           docker run --rm
           -v "$GITHUB_WORKSPACE:/work:ro" -w /work --entrypoint sh
           ghcr.io/home-assistant/home-assistant:2026.10.4@sha256:23f4dfbb69ce76315dbc4de7915504f1c2dcecd7ca2648113a493a385972e133
-          -c 'uv pip install --system --quiet ruff==0.14.3 && ruff check --no-cache custom_components/evohome tests'
+          -c 'uv pip install --system --quiet ruff==0.14.3 coverage==7.10.7 && ruff check --no-cache custom_components/evohome tests && COVERAGE_FILE=/tmp/evohome.coverage python -m coverage run --branch --source=custom_components.evohome.config_flow -m unittest discover -s tests && COVERAGE_FILE=/tmp/evohome.coverage python -m coverage report --fail-under=100 -m'
 
   hassfest:
     runs-on: ubuntu-latest
