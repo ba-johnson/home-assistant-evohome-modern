@@ -39,20 +39,26 @@ has not been submitted upstream.
 `core-modernization-v3.patch` is an alternative, larger patch against the same
 Core commit. It includes the DHW reset fix: apply one patch, not both.
 
-The migration adds UI setup, YAML import and repairs, reauthentication, options,
+The migration adds UI setup, YAML import and repairs, reauthentication,
 entry-owned runtime/token storage, measured room-temperature sensors and device
 metadata while preserving existing entity IDs and areas. It retains current
 Core's vendor 3.1.0 APIs and hourly schedule caching. Upstream ownership and
 requirements are preserved; HACS packaging is excluded.
+New setups use fixed polling; imported legacy polling settings are retained.
+The patch includes Core's generated config-flow and integration registrations.
 
 Verified with Python 3.14.10 and vendor 3.1.0:
 
-- Complete Evohome suite: **198 tests and 163 snapshots passed**.
-- Config flow: **100% line and branch coverage**, 19 tests.
+- Complete Evohome suite: **197 tests and 163 snapshots passed**.
+- Config flow: **100% line and branch coverage**, 18 tests.
 - Mypy: **14 source modules passed**; Ruff and current Core Hassfest passed.
+- Every applicable upstream hook passed on the contribution files, including
+  HA's Pylint checks, code spelling, formatting and generated registrations.
+  The isolated Alpine environment used system Node 24 for the pinned hook
+  definitions; the downloaded Node binary was incompatible with musl.
 - Patch reverse application checked against the tested tree.
 
-This remains a review candidate. Repository-wide hooks and human review are
+This remains a review candidate. Whole-Core CI and human review are
 separate gates; overnight pilot observation and standalone zone-reset target
 behaviour remain open. The current-Core migration has not been deployed to the
 older live pilot. Do not install this patch as a custom-component update.

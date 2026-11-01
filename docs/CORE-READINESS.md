@@ -24,12 +24,16 @@ Completed validation:
   Core's pinned `evohome-async==3.1.0` were used. See `contrib/README.md`.
 - The full migration is now rebased onto the same current Core commit and
   vendor 3.1.0, retaining its hourly schedule cache. The complete Evohome suite
-  passes: **198 tests and 163 snapshots**, mypy for 14 source modules, Ruff and
-  current Core Hassfest. Config-flow line and branch coverage is 100% (19 tests).
-  Migration tests cover existing IDs/areas, hot-water areas, reload/options,
+  passes: **197 tests and 163 snapshots**, mypy for 14 source modules, Ruff and
+  current Core Hassfest. Config-flow line and branch coverage is 100% (18 tests).
+  Migration tests cover existing IDs/areas, hot-water areas, reload/legacy settings,
   measured temperature metadata, failed-poll recovery and token isolation.
   See `contrib/core-modernization-v3.patch`; this is a review patch, not a
   replacement for the published alpha or a claim of current-Core live testing.
+- All applicable upstream hooks passed on the contribution files, including
+  HA Pylint and generated registrations. New setups use fixed polling; legacy
+  YAML polling settings are preserved. See `contrib/README.md` for the isolated
+  validation environment's Node runtime adjustment.
 
 Open acceptance work:
 
@@ -40,9 +44,9 @@ Open acceptance work:
   not restore. Cleanup restored the recorded target and FollowSchedule. The
   behaviour must be understood/fixed before a stable full-bundle release.
 - Complete graphical HACS acceptance if claiming a fully tested UI setup path.
-- Complete all Core pre-commit hooks and human review before upstream submission.
-  Repository-wide hooks are being checked in a real Git checkout; successful
-  component tests do not establish repository-wide CI acceptance.
+- Complete human review before upstream submission. A repository-wide hook run
+  was also started, but contribution-file hook success does not establish
+  whole-Core CI acceptance.
 
 Proposed contribution order (not submitted):
 
