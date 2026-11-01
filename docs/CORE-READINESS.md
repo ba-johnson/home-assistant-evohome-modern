@@ -22,6 +22,11 @@ Completed validation:
   `d6e25b0c2cb2eea0eb7b7f61691801fbf4a70a99` passed the full Evohome suite:
   169 tests, 163 snapshots, mypy for 10 modules and Ruff. Python 3.14.10 and
   Core's pinned `evohome-async==3.1.0` were used. See `contrib/README.md`.
+- The focused fix was independently rechecked on pristine pinned source with
+  a fresh Git index: 169 tests/163 snapshots and all applicable changed-file
+  hooks pass, including HA Pylint. Both distributable patches apply/reverse
+  cleanly and reproduce their validated files exactly. An unsubmitted PR draft
+  preserves the upstream template and leaves human attestations unchecked.
 - The full migration is now rebased onto the same current Core commit and
   vendor 3.1.0, retaining its hourly schedule cache. The complete Evohome suite
   passes: **197 tests and 163 snapshots**, mypy for 14 source modules, Ruff and
@@ -44,9 +49,11 @@ Open acceptance work:
   not restore. Cleanup restored the recorded target and FollowSchedule. The
   behaviour must be understood/fixed before a stable full-bundle release.
 - Complete graphical HACS acceptance if claiming a fully tested UI setup path.
-- Complete human review before upstream submission. A repository-wide hook run
-  was also started, but contribution-file hook success does not establish
-  whole-Core CI acceptance.
+- Complete human review before upstream submission. The broader all-files hook
+  run finished but was not clean: earlier formatting/findings were corrected
+  in the final patch, and mypy/Pylint also encountered unrelated dependency API
+  mismatches in the older base environment. Final contribution-file hooks pass;
+  whole-Core CI acceptance remains separate.
 
 Proposed contribution order (not submitted):
 

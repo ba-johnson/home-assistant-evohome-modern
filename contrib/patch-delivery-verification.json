@@ -1,0 +1,49 @@
+{
+  "core-reset-dhw.patch": {
+    "clean_apply": true,
+    "reverse_check": true,
+    "files": [
+      "homeassistant/components/evohome/button.py",
+      "tests/components/evohome/test_button.py",
+      "tests/components/evohome/test_system_reset_dhw.py"
+    ],
+    "matches_validated_tree": true
+  },
+  "core-modernization-v3.patch": {
+    "clean_apply": true,
+    "reverse_check": true,
+    "files": [
+      "homeassistant/components/evohome/__init__.py",
+      "homeassistant/components/evohome/button.py",
+      "homeassistant/components/evohome/climate.py",
+      "homeassistant/components/evohome/config_flow.py",
+      "homeassistant/components/evohome/coordinator.py",
+      "homeassistant/components/evohome/device.py",
+      "homeassistant/components/evohome/diagnostics.py",
+      "homeassistant/components/evohome/entity.py",
+      "homeassistant/components/evohome/icons.json",
+      "homeassistant/components/evohome/manifest.json",
+      "homeassistant/components/evohome/sensor.py",
+      "homeassistant/components/evohome/services.py",
+      "homeassistant/components/evohome/storage.py",
+      "homeassistant/components/evohome/strings.json",
+      "homeassistant/components/evohome/water_heater.py",
+      "homeassistant/generated/config_flows.py",
+      "homeassistant/generated/integrations.json",
+      "tests/components/evohome/conftest.py",
+      "tests/components/evohome/snapshots/test_button.ambr",
+      "tests/components/evohome/snapshots/test_climate.ambr",
+      "tests/components/evohome/snapshots/test_init.ambr",
+      "tests/components/evohome/snapshots/test_water_heater.ambr",
+      "tests/components/evohome/test_button.py",
+      "tests/components/evohome/test_climate.py",
+      "tests/components/evohome/test_config_flow.py",
+      "tests/components/evohome/test_coordinator.py",
+      "tests/components/evohome/test_entry_migration.py",
+      "tests/components/evohome/test_init.py",
+      "tests/components/evohome/test_storage.py",
+      "tests/components/evohome/test_system_reset_dhw.py"
+    ],
+    "matches_validated_tree": true
+  }
+}

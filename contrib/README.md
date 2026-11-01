@@ -18,9 +18,10 @@ Validated against Core commit `d6e25b0c2cb2eea0eb7b7f61691801fbf4a70a99`
 - The new regression fails without the fix and passes with it; patch reverse
   application was checked against the validated tree.
 
-Repository-wide pre-commit hooks still need running in a Git checkout before
-submission. The validation tree was a pinned source archive, so that command
-stopped with "Not in a Git repository"; this is not a claim of full Core CI.
+The focused fix was independently applied to a pristine pinned-source export
+with a fresh Git index. Its full suite again passed 169 tests/163 snapshots,
+and every applicable changed-file hook passed, including mypy, HA Pylint,
+formatting and spelling. No Core commit was made. This is not whole-Core CI.
 
 From a matching Core checkout with its development environment set up:
 
@@ -33,6 +34,22 @@ uv run --no-sync mypy --follow-imports=silent homeassistant/components/evohome
 Generate English translations using Core's documented development setup before
 tests. The patch retains upstream licence/ownership and needs human review; it
 has not been submitted upstream.
+
+The [unsubmitted PR draft](core-reset-pr-draft.md) preserves the pinned upstream
+template, including its unchecked human-review attestations. A reviewer should
+check these four behaviours against the three-file patch:
+
+- Reset heating first, then explicitly reset hot water when present.
+- Skip the hot-water command on systems without it.
+- Refresh HA state even if a command fails, while preserving the error.
+- Keep the existing button and service path; the tests require both reset calls.
+
+This fix does not establish the cause of unexpected overrides or resolve the
+separate individual-zone target-propagation issue.
+
+Both patches apply and reverse cleanly against pristine pinned source, and their
+changed files exactly match their tested trees. The portable result is recorded
+in [patch-delivery-verification.json](patch-delivery-verification.json).
 
 ## Full migration review patch
 
@@ -62,6 +79,11 @@ This remains a review candidate. Whole-Core CI and human review are
 separate gates; overnight pilot observation and standalone zone-reset target
 behaviour remain open. The current-Core migration has not been deployed to the
 older live pilot. Do not install this patch as a custom-component update.
+
+The broader all-files hook run completed: formatting initially changed files
+that were subsequently corrected, while mypy/Pylint also reported dependency
+API mismatches elsewhere in the older base environment. Final contribution-file
+hooks pass. No claim of a clean whole-Core development environment is made.
 
 The upstream [AI policy](https://github.com/home-assistant/core/blob/d6e25b0c2cb2eea0eb7b7f61691801fbf4a70a99/AI_POLICY.md)
 requires contributors to review and understand their changes before submission.
