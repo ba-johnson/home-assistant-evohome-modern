@@ -109,23 +109,27 @@ reload, actual rollback to the built-in integration, and reactivation. Legacy
 YAML was then removed and config-entry-only startup was verified after restart.
 See [pilot status](PILOT-TASK.md).
 
-Natural schedule-transition observation is still running. The pilot's large
+Natural schedule-transition observation was started for separate acceptance review.
+The pilot's large
 dashboard reset button was exercised on a phone: a permanent 5-degree override
 cleared, the vendor app returned to its prior target, and HA subsequently
 confirmed FollowSchedule at that target. HA's immediate state can lag the app
-until a later refresh. This does not establish standalone zone-reset behaviour.
+until a later refresh. A later physical-controller comparison is described below.
 The HACS installer backend passed clean-install/update checks. A focused
 upstream hot-water reset patch passed 169 Core tests and 163 snapshots, plus
-Core type checking. The larger migration bundle still needs rebasing onto
-current Core's vendor API and schedule caching. This is not a quality-tier or universal
+Core type checking. The larger migration bundle has been rebased onto
+Core's vendor 3.1.0 API and hourly schedule caching, with 205 passing tests.
+This is not a quality-tier or universal
 compatibility claim, and the unexplained original 5-degree setpoints have not
 been proven to have a single root cause.
 
-Controlled direct-zone tests reported FollowSchedule after clearing an override,
-but the effective target did not return to its prior value. The original target
-was explicitly restored and read back with FollowSchedule. Standalone zone-reset
-target propagation remains a confirmed acceptance failure; schedule mode alone is not proof of
-the effective target. This is separate from the successful system reset-all test.
+On 6 November, a controlled single-zone reset restored the physical controller
+and direct vendor API from 15.5 to 16 degrees, following the schedule, while HA
+temporarily retained 15.5. HA caught up on its normal five-minute poll without
+another heating command. This establishes a stale HA report in that test.
+The current-Core review patch now waits for the vendor's command-completion
+confirmation before refreshing, with a bounded timeout and regression coverage.
+That fix has not been deployed to the older live pilot or tested live on Core.
 
 The pilot also exposed own-area/own-name repairs when legacy entities gained
 devices. Those repairs were cleared using persisted, room-qualified registry

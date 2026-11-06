@@ -14,9 +14,9 @@ Publication and progression checklist:
 
 1. Keep the offline tests, Hassfest and lint passing (these currently pass and
    have repeatable CI commands). Official HACS packaging validation is now in
-   CI. Type checks and porting the fully covered downstream config-flow tests
-   to Core fixtures remain outstanding for stable/upstream readiness. Verify
-   GitHub Actions results after publication.
+   CI. The current-Core review patch also passes type checks, Core-fixture tests
+   and complete config-flow coverage; see [current readiness](CORE-READINESS.md)
+   for its live-acceptance limits. Verify GitHub Actions after publication.
 2. Complete a backed-up live pilot and rollback test. Record precisely which
    HA versions and controller types were actually tested.
 3. Review the copied source attribution and licence, and remove credentials,

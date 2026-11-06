@@ -47,7 +47,7 @@ A direct-zone temporary override was accepted. The immediate zone-reset target
 assertion did not pass even though the reported mode subsequently cleared; the
 original target was explicitly restored and verified. The repeated standalone
 zone-reset test also failed target acceptance after its mode cleared; this
-remains a stable-release blocker. Cleanup restored the recorded target and
+was treated as a stable-release blocker pending physical comparison. Cleanup restored the recorded target and
 FollowSchedule. No test override remains.
 
 The later naming-repair task cleared twelve live repairs using persistent,
@@ -65,3 +65,17 @@ portable review patch is under `contrib/`. All applicable upstream hooks pass
 on its changed files, including HA Pylint and generated registrations.
 This does not change the live pilot
 or close its standalone zone-reset/overnight acceptance work.
+
+Physical comparison follow-up (6 November): the pilot user confirmed a scheduled
+16-degree target, a temporary 15.5-degree override, then 16 degrees on schedule
+after the single-zone reset. The direct vendor API agreed with the controller;
+HA retained 15.5 until a later normal poll. No extra restoration command was
+needed. This test establishes HA reporting lag rather than controller failure.
+
+The current-Core patch now awaits vendor command completion before refreshing,
+with a 30-second bound per gateway task. Eight new regression cases cover
+fresh-target ordering, native/emulated reset-all batches, failure, timeout,
+cancellation and non-command responses. The complete suite passes 205 tests/163
+snapshots and all applicable contribution-file hooks.
+The stale-target cases fail without the fix and pass with it. The live older
+integration is unchanged; current-Core live acceptance remains pending.

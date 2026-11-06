@@ -1,4 +1,4 @@
-# Core contribution readiness — 1 November 2026
+# Core contribution readiness — 6 November 2026
 
 This is a downstream experimental integration, not an approved Core contribution.
 
@@ -29,7 +29,7 @@ Completed validation:
   preserves the upstream template and leaves human attestations unchecked.
 - The full migration is now rebased onto the same current Core commit and
   vendor 3.1.0, retaining its hourly schedule cache. The complete Evohome suite
-  passes: **197 tests and 163 snapshots**, mypy for 14 source modules, Ruff and
+  passes: **205 tests and 163 snapshots**, mypy for 14 source modules, Ruff and
   current Core Hassfest. Config-flow line and branch coverage is 100% (18 tests).
   Migration tests cover existing IDs/areas, hot-water areas, reload/legacy settings,
   measured temperature metadata, failed-poll recovery and token isolation.
@@ -39,15 +39,24 @@ Completed validation:
   HA Pylint and generated registrations. New setups use fixed polling; legacy
   YAML polling settings are preserved. See `contrib/README.md` for the isolated
   validation environment's Node runtime adjustment.
+- A physical-controller comparison confirmed that a single-zone reset restored
+  the physical and vendor target to 16 while HA temporarily retained 15.5. HA
+  later caught up on normal polling without another heating command. The Core
+  patch now waits for vendor command completion before refreshing, bounded to
+  30 seconds per task, including native/emulated reset-all batches. Eight new
+  tests cover success ordering, batching, failure, timeout, cancellation and
+  non-command results; the stale-target/reset-all regression fails
+  without the change and passes with it.
 
 Open acceptance work:
 
 - Complete the bounded natural schedule observation. Natural hot-water and
   heating transitions have been captured; the overnight/full observation window
   remains pending. A read-only summary is generated automatically at completion.
-- Standalone zone reset was reproduced: mode cleared but effective target did
-  not restore. Cleanup restored the recorded target and FollowSchedule. The
-  behaviour must be understood/fixed before a stable full-bundle release.
+- Validate the command-completion change on a compatible current-Core live
+  system. The physical comparison diagnoses reporting lag in the older pilot;
+  the newer vendor API is not deployed to that pilot. The original unexplained
+  permanent overrides remain a separate unresolved cause investigation.
 - Complete graphical HACS acceptance if claiming a fully tested UI setup path.
 - Complete human review before upstream submission. The broader all-files hook
   run finished but was not clean: earlier formatting/findings were corrected

@@ -37,6 +37,7 @@
       "tests/components/evohome/snapshots/test_water_heater.ambr",
       "tests/components/evohome/test_button.py",
       "tests/components/evohome/test_climate.py",
+      "tests/components/evohome/test_command_completion.py",
       "tests/components/evohome/test_config_flow.py",
       "tests/components/evohome/test_coordinator.py",
       "tests/components/evohome/test_entry_migration.py",

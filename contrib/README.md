@@ -63,10 +63,14 @@ Core's vendor 3.1.0 APIs and hourly schedule caching. Upstream ownership and
 requirements are preserved; HACS packaging is excluded.
 New setups use fixed polling; imported legacy polling settings are retained.
 The patch includes Core's generated config-flow and integration registrations.
+It also waits for vendor command completion before refreshing state, with a
+30-second timeout per gateway task. Native and emulated reset-all task batches
+are also awaited. Merely accepting a PUT does not mean the gateway has applied
+it. Failed commands and timeouts are reported; cancellation is preserved.
 
 Verified with Python 3.14.10 and vendor 3.1.0:
 
-- Complete Evohome suite: **197 tests and 163 snapshots passed**.
+- Complete Evohome suite: **205 tests and 163 snapshots passed**.
 - Config flow: **100% line and branch coverage**, 18 tests.
 - Mypy: **14 source modules passed**; Ruff and current Core Hassfest passed.
 - Every applicable upstream hook passed on the contribution files, including
@@ -74,10 +78,14 @@ Verified with Python 3.14.10 and vendor 3.1.0:
   The isolated Alpine environment used system Node 24 for the pinned hook
   definitions; the downloaded Node binary was incompatible with musl.
 - Patch reverse application checked against the tested tree.
+- Four stale-target/reset-all regression cases fail without the completion wait;
+  all eight completion cases pass with it. Validated source was restored exactly.
 
 This remains a review candidate. Whole-Core CI and human review are
-separate gates; overnight pilot observation and standalone zone-reset target
-behaviour remain open. The current-Core migration has not been deployed to the
+separate gates. A physical-controller comparison confirmed that a single-zone
+reset restored the real target while HA's older integration temporarily lagged.
+Live acceptance of the completion-wait change and overnight observation review
+remain open. The current-Core migration has not been deployed to the
 older live pilot. Do not install this patch as a custom-component update.
 
 The broader all-files hook run completed: formatting initially changed files

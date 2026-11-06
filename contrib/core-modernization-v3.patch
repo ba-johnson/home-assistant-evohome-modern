@@ -608,10 +608,14 @@ index 0000000000..7ba72203f0
 +            errors=errors,
 +        )
 diff --git a/homeassistant/components/evohome/coordinator.py b/homeassistant/components/evohome/coordinator.py
-index e03f4cb413..de5fdc0e59 100644
+index e03f4cb413..aca67d3451 100644
 --- a/homeassistant/components/evohome/coordinator.py
 +++ b/homeassistant/components/evohome/coordinator.py
-@@ -4,7 +4,7 @@ from collections.abc import Awaitable
+@@ -1,10 +1,11 @@
+ """Support for (EMEA/EU-based) Honeywell TCC systems."""
+ 
++import asyncio
+ from collections.abc import Awaitable
  from datetime import datetime, timedelta
  from http import HTTPStatus
  import logging
@@ -620,7 +624,7 @@ index e03f4cb413..de5fdc0e59 100644
  
  import evohomeasync as ec1
  import evohomeasync2 as ec2
-@@ -29,12 +29,15 @@ from evohomeasync2.typedefs import (
+@@ -29,12 +30,17 @@ from evohomeasync2.typedefs import (
  
  from homeassistant.const import CONF_SCAN_INTERVAL
  from homeassistant.core import HomeAssistant
@@ -634,10 +638,12 @@ index e03f4cb413..de5fdc0e59 100644
 +if TYPE_CHECKING:
 +    from . import EvoConfigEntry
 +
++COMMAND_TIMEOUT: Final = 30
++
  type _Schedule = list[EvoDhwScheduleDayOfWeekT] | list[EvoZonScheduleDayOfWeekT]
  
  _ERR_SCHEDULE_UPDATE: Final = (
-@@ -58,6 +61,9 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -58,6 +64,9 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
          name: str,
          update_interval: timedelta,
          location_idx: int,
@@ -647,7 +653,7 @@ index e03f4cb413..de5fdc0e59 100644
          client_v1: ec1.EvohomeClient | None = None,
      ) -> None:
          """Class to manage fetching data."""
-@@ -65,7 +71,7 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -65,7 +74,7 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
          super().__init__(
              hass,
              logger,
@@ -656,7 +662,7 @@ index e03f4cb413..de5fdc0e59 100644
              name=name,
              update_interval=update_interval,
          )
-@@ -74,6 +80,8 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -74,6 +83,8 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
          self.client_v1 = client_v1
  
          self.loc_idx = location_idx
@@ -665,7 +671,7 @@ index e03f4cb413..de5fdc0e59 100644
  
          self.data: EvoLocStatusT = None  # type: ignore[assignment]
          self.temps: dict[str, float | None] = {}
-@@ -81,22 +89,6 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -81,22 +92,6 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
          self._first_refresh_done = False  # get schedules only after first refresh
          self._schedules_fetched: dict[str, datetime] = {}  # by DHW/zone id
  
@@ -688,7 +694,7 @@ index e03f4cb413..de5fdc0e59 100644
      @override
      async def _async_setup(self) -> None:
          """Set up the coordinator.
-@@ -106,23 +98,29 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -106,23 +101,29 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
  
          try:
              await self.client.setup()  # only config for now
@@ -732,12 +738,19 @@ index e03f4cb413..de5fdc0e59 100644
  
          if self.logger.isEnabledFor(logging.DEBUG):
              loc_info = {
-@@ -162,8 +160,19 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -161,9 +162,37 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+ 
          try:
              result = await client_api
- 
--        except ec2.AuthenticationFailedError:
--            raise
++            tasks: list[ec2.CommTask] = []
++            if isinstance(result, ec2.CommTask):
++                tasks.append(result)
++            elif isinstance(result, list):
++                tasks.extend(task for task in result if isinstance(task, ec2.CommTask))
++            for task in tasks:
++                async with asyncio.timeout(COMMAND_TIMEOUT):
++                    await task.wait(interval=1)
++
 +        except ec2.BadUserCredentialsError as err:
 +            if self.config_entry is not None:
 +                self.config_entry.async_start_reauth(self.hass)
@@ -752,9 +765,31 @@ index e03f4cb413..de5fdc0e59 100644
 +                translation_placeholders={"error": str(err)},
 +            ) from err
  
+-        except ec2.AuthenticationFailedError:
+-            raise
++        except TimeoutError as err:
++            raise HomeAssistantError(
++                translation_domain=DOMAIN,
++                translation_key="api_call_failed",
++                translation_placeholders={
++                    "error": "Timed out waiting for controller confirmation"
++                },
++            ) from err
+ 
          except ec2.ApiCallFailedError as err:
              raise HomeAssistantError(
-@@ -193,6 +202,7 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -172,8 +201,8 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+                 translation_placeholders={"error": str(err)},
+             ) from err
+ 
+-        if request_refresh:  # wait a moment for system to quiesce before updating state
+-            await self.async_request_refresh()  # hass.async_create_task() won't help
++        if request_refresh:
++            await self.async_request_refresh()
+ 
+         return result
+ 
+@@ -193,6 +222,7 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
                  ),
                  err,
              )
@@ -762,12 +797,21 @@ index e03f4cb413..de5fdc0e59 100644
              self.client_v1 = None
  
          except ec1.EvohomeError as err:
-@@ -219,6 +229,8 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
+@@ -219,6 +249,17 @@ class EvoDataUpdateCoordinator(DataUpdateCoordinator[EvoLocStatusT]):
          try:
              status = await self.loc.get_status()
  
 +        except ec2.BadUserCredentialsError as err:
 +            raise ConfigEntryAuthFailed from err
++        except TimeoutError as err:
++            raise HomeAssistantError(
++                translation_domain=DOMAIN,
++                translation_key="api_call_failed",
++                translation_placeholders={
++                    "error": "Timed out waiting for controller confirmation"
++                },
++            ) from err
++
          except ec2.ApiCallFailedError as err:
              if err.status != HTTPStatus.TOO_MANY_REQUESTS:
                  raise UpdateFailed(err) from err
@@ -2418,6 +2462,145 @@ index 22aa66cda2..e07b442a0e 100644
      ):
          await hass.services.async_call(
              CLIMATE_DOMAIN,
+diff --git a/tests/components/evohome/test_command_completion.py b/tests/components/evohome/test_command_completion.py
+new file mode 100644
+index 0000000000..e973061c8e
+--- /dev/null
++++ b/tests/components/evohome/test_command_completion.py
+@@ -0,0 +1,133 @@
++"""Regression tests for refreshing before accepted heating commands finish."""
++
++import asyncio
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import evohomeasync2 as evo
++import pytest
++
++from homeassistant.components.evohome.coordinator import EvoDataUpdateCoordinator
++from homeassistant.exceptions import HomeAssistantError
++
++
++@pytest.fixture
++def coordinator() -> MagicMock:
++    """Isolate command completion from periodic polling and HTTP transport."""
++    result = MagicMock(spec=EvoDataUpdateCoordinator)
++    result.config_entry = None
++    result.async_request_refresh = AsyncMock()
++    return result
++
++
++@pytest.mark.parametrize("request_refresh", [True, False])
++async def test_refresh_observes_completed_command(
++    coordinator: MagicMock, request_refresh: bool
++) -> None:
++    """Do not publish the old target while a successful PUT is still queued."""
++    target = 15.5
++    observed = []
++    task = evo.CommTask(MagicMock(), "test-task")
++
++    async def finish(*, interval: float) -> None:
++        nonlocal target
++        target = 16.0
++
++    async def refresh() -> None:
++        observed.append(target)
++
++    coordinator.async_request_refresh = AsyncMock(side_effect=refresh)
++    with patch.object(task, "wait", AsyncMock(side_effect=finish)) as wait:
++        result = await EvoDataUpdateCoordinator.call_client_api(
++            coordinator, AsyncMock(return_value=task)(), request_refresh=request_refresh
++        )
++    wait.assert_awaited_once_with(interval=1)
++    assert result is task
++    assert target == 16.0
++    assert observed == [16.0] * int(request_refresh)
++
++
++async def test_failed_command_is_reported(coordinator: MagicMock) -> None:
++    """Do not report a merely accepted command as successfully applied."""
++    task = evo.CommTask(MagicMock(), "failed-task")
++    with (
++        patch.object(
++            task,
++            "wait",
++            AsyncMock(side_effect=evo.CommTaskFailedError("gateway refused")),
++        ),
++        pytest.raises(HomeAssistantError) as raised,
++    ):
++        await EvoDataUpdateCoordinator.call_client_api(
++            coordinator, AsyncMock(return_value=task)()
++        )
++    assert raised.value.translation_key == "api_call_failed"
++    coordinator.async_request_refresh.assert_not_awaited()
++
++
++async def test_command_wait_is_bounded(coordinator: MagicMock) -> None:
++    """A queued command must not hold the service call indefinitely."""
++    task = evo.CommTask(MagicMock(), "stalled-task")
++    blocked = asyncio.Event()
++
++    async def wait_forever(*, interval: float) -> None:
++        await blocked.wait()
++
++    with (
++        patch("homeassistant.components.evohome.coordinator.COMMAND_TIMEOUT", 0),
++        patch.object(task, "wait", AsyncMock(side_effect=wait_forever)),
++        pytest.raises(HomeAssistantError) as raised,
++    ):
++        await EvoDataUpdateCoordinator.call_client_api(
++            coordinator, AsyncMock(return_value=task)()
++        )
++    assert raised.value.translation_key == "api_call_failed"
++    coordinator.async_request_refresh.assert_not_awaited()
++
++
++async def test_command_wait_preserves_cancellation(coordinator: MagicMock) -> None:
++    """Do not swallow HA shutdown or service cancellation."""
++    task = evo.CommTask(MagicMock(), "cancelled-task")
++    with (
++        patch.object(task, "wait", AsyncMock(side_effect=asyncio.CancelledError)),
++        pytest.raises(asyncio.CancelledError),
++    ):
++        await EvoDataUpdateCoordinator.call_client_api(
++            coordinator, AsyncMock(return_value=task)()
++        )
++    coordinator.async_request_refresh.assert_not_awaited()
++
++
++async def test_non_command_result_is_preserved(coordinator: MagicMock) -> None:
++    """Keep non-command API return values and refresh behaviour compatible."""
++    payload = {"test": "response"}
++    result = await EvoDataUpdateCoordinator.call_client_api(
++        coordinator, AsyncMock(return_value=payload)()
++    )
++    assert result is payload
++    coordinator.async_request_refresh.assert_awaited_once_with()
++
++
++@pytest.mark.parametrize("task_count", [1, 3])
++async def test_reset_all_batch_finishes_before_refresh(
++    coordinator: MagicMock, task_count: int
++) -> None:
++    """Native and emulated system resets both return a list of gateway tasks."""
++    events = []
++    tasks = [evo.CommTask(MagicMock(), f"test-task-{idx}") for idx in range(task_count)]
++
++    async def finish(*, interval: float) -> None:
++        events.append("completed")
++
++    async def refresh() -> None:
++        events.append("refreshed")
++
++    coordinator.async_request_refresh = AsyncMock(side_effect=refresh)
++    for task in tasks:
++        task.wait = AsyncMock(side_effect=finish)
++    result = await EvoDataUpdateCoordinator.call_client_api(
++        coordinator, AsyncMock(return_value=tasks)()
++    )
++    assert result is tasks
++    assert events == ["completed"] * task_count + ["refreshed"]
++    for task in tasks:
++        task.wait.assert_awaited_once_with(interval=1)
 diff --git a/tests/components/evohome/test_config_flow.py b/tests/components/evohome/test_config_flow.py
 new file mode 100644
 index 0000000000..c19d807851
